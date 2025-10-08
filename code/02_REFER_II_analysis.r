@@ -1,4 +1,9 @@
-
+# ===============================================================================================
+# ICU Respiratory Failure Environmental Risk (REFER) Index
+# PI: Peter Graffy (graffy@uchicago.edu)
+# Run this script after running: 01_REFER_cohort_identification.R
+# Purpose: Build trajectories per patient, 
+# ===============================================================================================
 
 
 # Core
@@ -12,6 +17,7 @@ library(data.table)
 library(dtwclust)   # DTW-based time-series clustering
 library(nnet)       # multinomial regression for class ~ exposures
 library(ggplot2)
+library(fasttime)
 
 exposome_dir <- "exposome"
 
@@ -538,6 +544,424 @@ traj_profiles <- icu_panel %>%
     n = n(),
     .groups = "drop"
   )
+
+######################## HOURLY Traj
+
+
+h_cap <- 168L  # 7 days of hours; change to 240L for 10 days, etc.
+
+cohort_stays_hr <- cohort %>%
+  mutate(
+    first_icu_in = as_datetime(first_icu_in, tz = "UTC"),
+    last_icu_out = as_datetime(last_icu_out, tz = "UTC")
+  ) %>%
+  filter(!is.na(first_icu_in), !is.na(last_icu_out), last_icu_out > first_icu_in) %>%
+  transmute(hospitalization_id,
+            start_hr = floor_date(first_icu_in, "hour"),
+            end_hr   = floor_date(last_icu_out, "hour"))
+
+hour_grid <- cohort_stays_hr %>%
+  rowwise() %>%
+  mutate(hr_seq = list(seq.POSIXt(start_hr, end_hr, by = "hour"))) %>%
+  unnest(hr_seq) %>%
+  group_by(hospitalization_id) %>%
+  mutate(hour_idx = as.integer(difftime(hr_seq, min(hr_seq), units = "hours")) + 1L) %>%
+  ungroup() %>%
+  filter(hour_idx <= h_cap) %>%
+  rename(hour_ts = hr_seq)
+
+# helper: 0/1 coercer
+as01 <- function(x) {
+  x <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    x %in% c("1","true","t","yes","y") ~ 1L,
+    x %in% c("0","false","f","no","n","") ~ 0L,
+    suppressWarnings(!is.na(as.numeric(x)) & as.numeric(x) > 0) ~ 1L,
+    suppressWarnings(!is.na(as.numeric(x)) & as.numeric(x) == 0) ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+# normalize FiO2 to percent
+norm_fio2 <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  case_when(is.na(x) ~ NA_real_, x <= 1 ~ x*100, TRUE ~ x)
+}
+
+# Pre-filter rs_raw to ICU range to cut rows early
+rs_small <- rs_raw %>%
+  semi_join(
+    cohort %>%
+      mutate(icu_start = as_datetime(first_icu_in, tz="UTC"),
+             icu_end   = as_datetime(last_icu_out, tz="UTC")) %>%
+      select(hospitalization_id, icu_start, icu_end),
+    by = "hospitalization_id"
+  ) %>%
+  # cheap filter by recorded_dttm before parse (if available)
+  filter(!is.na(recorded_dttm))
+
+# Precompute regex
+re_ac_vc <- regex("assist.?control.*volume|ac.?vc", ignore_case = TRUE)
+re_ac_pc <- regex("assist.?control.*pressure|ac.?pc", ignore_case = TRUE)
+re_simv  <- fixed("simv", ignore_case = TRUE)
+re_psv   <- regex("psv|pressure support", ignore_case = TRUE)
+re_inv   <- regex("invasive|mechanical|vent", ignore_case = TRUE)
+
+# robust parser that tries several formats + epoch
+parse_ts <- function(x, tz = "UTC") {
+  x_chr <- as.character(x)
+  
+  # if looks like pure digits of epoch seconds or milliseconds
+  is_epoch <- str_detect(x_chr, "^\\d{10}(?:\\d{3})?$")
+  out <- rep(NA_real_, length(x_chr))
+  
+  # epoch seconds/millis
+  if (any(is_epoch)) {
+    xe <- x_chr[is_epoch]
+    # 13-digit -> ms; 10-digit -> s
+    out[is_epoch] <- as.numeric(ifelse(nchar(xe) >= 13, as.numeric(xe)/1000, as.numeric(xe)))
+  }
+  
+  # try multiple text formats for the rest
+  need <- is.na(out) & !is.na(x_chr)
+  if (any(need)) {
+    out[need] <- suppressWarnings(lubridate::parse_date_time(
+      x_chr[need],
+      orders = c(          # generous and fast enough
+        "ymd HMS","ymd HM","ymd H",
+        "Ymd HMS","Ymd HM","Ymd H",
+        "mdy HMS","mdy HM","mdy H",
+        "dmy HMS","dmy HM","dmy H"
+      ),
+      tz = tz,
+      truncated = 3
+    )) |> as.numeric()
+  }
+  
+  # return POSIXct
+  as.POSIXct(out, origin = "1970-01-01", tz = tz)
+}
+
+# ---- start here instead of ymd_hms() ----
+rs_small_parsed <- rs_small %>%
+  mutate(
+    time_raw = coalesce(as.character(recorded_dttm), as.character(recorded_time)),
+    time     = parse_ts(time_raw, tz = "UTC")
+  )
+
+# quick diagnostic (optional)
+n_failed <- sum(is.na(rs_small_parsed$time) & !is.na(rs_small_parsed$time_raw))
+message("Unparseable timestamps: ", n_failed)
+
+rs_step1 <- rs_small_parsed %>%
+  filter(!is.na(time)) %>%
+  select(
+    hospitalization_id, time,
+    recorded_dttm, recorded_time,
+    device_category, mode_category, mode_name,
+    artificial_airway, tracheostomy,
+    fio2_set, tidal_volume_set, resp_rate_set,
+    pressure_control_set, pressure_support_set, peep_set,
+    peak_inspiratory_pressure_obs, plateau_pressure_obs, peep_obs, minute_vent_obs
+  ) %>%
+  mutate(hour_ts = floor_date(time, "hour"))
+
+# pre-cast numerics once; suppressWarnings in one place
+num_cols <- c("fio2_set","tidal_volume_set","resp_rate_set","pressure_control_set",
+              "pressure_support_set","peep_set","peak_inspiratory_pressure_obs",
+              "plateau_pressure_obs","peep_obs","minute_vent_obs")
+
+rs_step2 <- rs_step1 %>%
+  mutate(
+    device_category_lc = tolower(device_category),
+    mode_category_lc   = tolower(mode_category),
+    mode_name_lc       = tolower(mode_name),
+    across(all_of(num_cols), ~ suppressWarnings(as.numeric(.x))),
+    artificial_airway  = as01(artificial_airway),
+    tracheostomy       = as01(tracheostomy)
+  ) %>%
+  # normalize FiO2 to percent
+  mutate(fio2_set = if_else(is.na(fio2_set), NA_real_, if_else(fio2_set <= 1, fio2_set*100, fio2_set)))
+
+rs_step3 <- rs_step2 %>%
+  mutate(
+    mode_ac_vc = str_detect(mode_category_lc, re_ac_vc),
+    mode_ac_pc = str_detect(mode_category_lc, re_ac_pc),
+    mode_simv  = str_detect(mode_category_lc, re_simv),
+    mode_psv   = str_detect(mode_category_lc, re_psv),
+    mode_invasive = (artificial_airway == 1L | tracheostomy == 1L |
+                       str_detect(device_category_lc, re_inv))
+  )
+
+
+rs_step4 <- rs_step3 %>%
+  transmute(
+    hospitalization_id, hour_ts, mode_invasive,
+    set_rr   = if_else(mode_ac_vc | mode_ac_pc | mode_simv, resp_rate_set, NA_real_),
+    set_vt   = if_else(mode_ac_vc | mode_simv, tidal_volume_set, NA_real_),
+    set_pc   = if_else(mode_ac_pc, pressure_control_set, NA_real_),
+    set_ps   = if_else(mode_psv | mode_simv, pressure_support_set, NA_real_),
+    set_peep = coalesce(peep_obs, peep_set),
+    set_fio2 = fio2_set,
+    pip_obs  = peak_inspiratory_pressure_obs,
+    pplat_obs= plateau_pressure_obs,
+    mv_obs   = minute_vent_obs
+  )
+
+# Helpers: no warnings, return NA if a group has no finite values
+safe_max <- function(x) {
+  v <- x[is.finite(x)]
+  if (length(v) == 0) NA_real_ else max(v)
+}
+safe_med <- function(x) {
+  v <- x[is.finite(x)]
+  if (length(v) == 0) NA_real_ else stats::median(v)
+}
+
+rs_hr <- rs_step4 %>%
+  summarise(
+    any_imv   = as.integer(any(mode_invasive == 1L, na.rm = TRUE)),
+    fio2_max  = safe_max(set_fio2),
+    peep_med  = safe_med(set_peep),
+    rr_med    = safe_med(set_rr),
+    vt_med    = safe_med(set_vt),
+    pc_med    = safe_med(set_pc),
+    ps_med    = safe_med(set_ps),
+    pip_med   = safe_med(pip_obs),
+    pplat_med = safe_med(pplat_obs),
+    mv_med    = safe_med(mv_obs),
+    .by = c(hospitalization_id, hour_ts)
+  )
+
+
+### clean up environment
+
+# 2) Decide what to KEEP for the next steps (edit if needed)
+keep <- c(
+  "cohort",             # cohort-level metadata
+  "rs_raw",             # respiratory support raw
+  "vitals_raw",         # vitals raw (long form)
+  "clif_labs",          # labs (for ABGs)
+  "exposome_dir",       # path to exposome files
+  "no2_mo", "pm25_mo",  # monthly exposures if already loaded (optional)
+  "cohort_expo",        # exposure-joined cohort (optional)
+  "rs_hr",              # already computed hourly resp support
+  "hour_grid",          # ICU hourly grid
+  "parse_ts", "as01",   # helper functions you've defined
+  "re_ac_vc","re_ac_pc","re_simv","re_psv","re_inv"  # compiled regex
+)
+
+# 3) Drop everything else and GC
+rm(list = setdiff(ls(), keep))
+gc(full = TRUE)
+
+library(DBI)
+library(duckdb)
+
+# Connect (reuse your existing connection if you already have one)
+con <- dbConnect(duckdb::duckdb(), dbdir = tempfile())
+
+# If you haven't already copied vitals_raw into DuckDB:
+copy_to(con, vitals_raw, "vitals", temporary = FALSE, overwrite = TRUE)
+
+# Build the query with dbplyr; use sql() where we need explicit DuckDB functions
+spo2_tbl <- tbl(con, "vitals") %>%
+  transmute(
+    hospitalization_id,
+    recorded_dttm,
+    vital_name,
+    vital_category,
+    vital_value
+  ) %>%
+  mutate(
+    vname_lc = sql("lower(vital_name)"),
+    vcat_lc  = sql("lower(vital_category)"),
+    looks_spo2 = sql(
+      "regexp_matches(vname_lc, 'spo2|sp[ _-]?o2|o2[ _-]?sat|oxygen[ _-]?saturation')
+       OR regexp_matches(vcat_lc,  'spo2|o2|oxygen')"
+    )
+  ) %>%
+  filter(looks_spo2) %>%
+  mutate(
+    ts = sql("try_cast(recorded_dttm AS TIMESTAMP)"),
+    hour_ts = sql("date_trunc('hour', ts)"),
+    val = sql("try_cast(regexp_replace(CAST(vital_value AS VARCHAR), '[^0-9\\.-]', '', 'g') AS DOUBLE)")
+  ) %>%
+  filter(!is.na(hour_ts), !is.na(val)) %>%
+  group_by(hospitalization_id, hour_ts) %>%
+  summarise(
+    spo2_med = sql("median(val)"),  # NA-safe in SQL, avoids dbplyr NA warning
+    .groups = "drop"
+  )
+
+# Materialize to R (already aggregated)
+spo2_hr <- collect(spo2_tbl)
+
+# Optional: close DB when done
+dbDisconnect(con, shutdown = TRUE)
+
+
+# Optional: drop objects used above
+rm(vitals_min, ids, id_chunks); gc()
+
+clif_labs <- clif_tables[[4]]
+
+# ABGs (pH, PaCO2, PaO2)
+labs_hr <- clif_labs %>%
+  transmute(
+    hospitalization_id,
+    time = ymd_hms(result_dttm, tz = "UTC"),
+    hour_ts = floor_date(time, "hour"),
+    lname = tolower(lab_name),
+    val   = num_safely(result_value)
+  ) %>%
+  mutate(
+    ph   = if_else(str_detect(lname, "\\bph\\b|arterial ph|blood gas ph"), val, NA_real_),
+    paco2= if_else(str_detect(lname, "paco2|pa co2|arterial co2"), val, NA_real_),
+    pao2 = if_else(str_detect(lname, "pao2|pa o2|arterial o2"), val, NA_real_)
+  ) %>%
+  group_by(hospitalization_id, hour_ts) %>%
+  summarise(
+    ph_med    = median(ph,    na.rm = TRUE),
+    paco2_med = median(paco2, na.rm = TRUE),
+    pao2_med  = median(pao2,  na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+
+icu_hourly <- hour_grid %>%
+  left_join(rs_hr,   by = c("hospitalization_id","hour_ts")) %>%
+  left_join(spo2_hr, by = c("hospitalization_id","hour_ts")) %>%
+  left_join(labs_hr, by = c("hospitalization_id","hour_ts")) %>%
+  arrange(hospitalization_id, hour_idx) %>%
+  group_by(hospitalization_id) %>%
+  # carry last obs forward within the capped window
+  mutate(across(c(any_imv, fio2_max, peep_med, rr_med, vt_med, pc_med, ps_med,
+                  pip_med, pplat_med, mv_med, spo2_med, ph_med, paco2_med, pao2_med),
+                ~ zoo::na.locf(.x, na.rm = FALSE))) %>%
+  ungroup() %>%
+  # replace remaining NAs with clinically neutral values
+  mutate(
+    any_imv   = replace_na(any_imv, 0L),
+    spo2_med  = replace_na(spo2_med, 97),   # benign saturation
+    fio2_max  = replace_na(fio2_max, 40),   # room air-ish to low O2
+    peep_med  = replace_na(peep_med, 5),
+    rr_med    = replace_na(rr_med, 14),
+    vt_med    = replace_na(vt_med, 450),
+    pc_med    = replace_na(pc_med, 0),
+    ps_med    = replace_na(ps_med, 0),
+    pip_med   = replace_na(pip_med, NA_real_),
+    pplat_med = replace_na(pplat_med, NA_real_),
+    mv_med    = replace_na(mv_med, NA_real_),
+    ph_med    = replace_na(ph_med, 7.40),
+    paco2_med = replace_na(paco2_med, 40),
+    pao2_med  = replace_na(pao2_med, 80)
+  )
+
+
+
+no2_mo <- readr::read_csv(file.path(exposome_dir, "no2_county_month.csv"), show_col_types=FALSE) %>%
+  transmute(county_fips = as.character(county_fips),
+            ym = make_date(year, month, 1),
+            no2 = as.double(no2))
+
+pm25_mo <- readr::read_csv(file.path(exposome_dir, "pm25_county_month.csv"), show_col_types=FALSE) %>%
+  transmute(county_fips = as.character(county_fips),
+            ym = make_date(year, month, 1),
+            pm25 = as.double(pm25))
+
+# build 12-month monthly sequence ending the month before admission, then interpolate to hourly
+build_exposure_embedding <- function(fips, admit_ts) {
+  end_m   <- floor_date(admit_ts %m-% months(1), "month")
+  start_m <- end_m %m-% months(11)
+  mo_grid <- tibble(ym = seq.Date(start_m, end_m, by = "month"))
+  # join county series
+  series <- mo_grid %>%
+    left_join(filter(no2_mo, county_fips == fips), by="ym") %>%
+    left_join(filter(pm25_mo, county_fips == fips), by="ym")
+  # fallback fill with county means if gaps (rare)
+  if (anyNA(series$no2))  series$no2  <- zoo::na.locf(series$no2, na.rm = FALSE)
+  if (anyNA(series$pm25)) series$pm25 <- zoo::na.locf(series$pm25, na.rm = FALSE)
+  
+  # hourly time grid for past h_cap hours before admission
+  hr_grid <- tibble(hour_ts = seq.POSIXt(admit_ts - hours(h_cap-1), admit_ts, by = "hour"))
+  
+  # linear interpolation month→hour using approx
+  # map monthly points to their POSIXct timestamps (start of month)
+  x_no2  <- as.numeric(as.POSIXct(series$ym, tz = "UTC"))
+  y_no2  <- series$no2
+  x_pm25 <- as.numeric(as.POSIXct(series$ym, tz = "UTC"))
+  y_pm25 <- series$pm25
+  xout   <- as.numeric(as.POSIXct(hr_grid$hour_ts, tz = "UTC"))
+  
+  no2_hr  <- approx(x = x_no2,  y = y_no2,  xout = xout, method = "linear", rule = 2)$y
+  pm25_hr <- approx(x = x_pm25, y = y_pm25, xout = xout, method = "linear", rule = 2)$y
+  
+  tibble(hour_ts = hr_grid$hour_ts, no2_hist = no2_hr, pm25_hist = pm25_hr)
+}
+
+# build once per encounter
+admit_tbl <- cohort %>%
+  transmute(hospitalization_id, county_fips = as.character(county_fips),
+            admit_ts = as_datetime(admission_dttm, tz = "UTC"))
+
+embeddings <- admit_tbl %>%
+  mutate(embed = pmap(list(county_fips, admit_ts), build_exposure_embedding)) %>%
+  select(hospitalization_id, embed) %>%
+  unnest(embed)
+
+
+
+traj_hr <- icu_hourly %>%
+  left_join(embeddings, by = c("hospitalization_id","hour_ts")) %>%
+  mutate(
+    no2_hist  = replace_na(no2_hist, median(no2_hist, na.rm = TRUE)),
+    pm25_hist = replace_na(pm25_hist, median(pm25_hist, na.rm = TRUE))
+  ) %>%
+  # build a composite signal for DTW (z-score each feature, then average)
+  group_by(hospitalization_id) %>%
+  arrange(hour_idx, .by_group = TRUE) %>%
+  mutate(
+    z = function(x){ s <- sd(x, na.rm=TRUE); m <- mean(x, na.rm=TRUE); ifelse(is.na(s) || s==0, 0, (x-m)/s) },
+    sig = rowMeans(cbind(
+      z(as.numeric(any_imv)),
+      z(fio2_max), z(peep_med), z(rr_med), z(vt_med), z(pc_med), z(ps_med),
+      z(spo2_med * -1),   # lower SpO2 worse → invert
+      z(ph_med * -1),     # acidemia worse → invert
+      z(paco2_med),       # hypercapnia worse
+      z(pao2_med * -1),   # lower PaO2 worse
+      z(no2_hist), z(pm25_hist)   # EMBEDDED exposures
+    ), na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+
+
+series_df_hr <- traj_hr %>%
+  select(hospitalization_id, hour_idx, sig) %>%
+  arrange(hospitalization_id, hour_idx) %>%
+  group_by(hospitalization_id) %>%
+  summarise(traj = list(as.numeric(sig)), .groups = "drop") %>%
+  # drop degenerate series
+  filter(map_lgl(traj, ~ any(is.finite(.x) & .x != 0)))
+
+ts_list <- series_df_hr$traj
+set.seed(123)
+k <- 4  # tune as needed
+
+clust_hr <- tsclust(
+  ts_list, type = "partitional", k = k,
+  distance = "dtw_basic", centroid = "dba",
+  seed = 123, trace = TRUE,
+  args = tsclust_args(dist = list(window.size = 6))  # small Sakoe-Chiba band for hourly misalignment
+)
+
+series_df_hr$traj_cluster_hr <- factor(clust_hr@cluster, levels = 1:k, labels = paste0("C",1:k))
+
+# Attach back to cohort for modeling
+cohort_traj_hr <- cohort %>%
+  left_join(series_df_hr %>% select(hospitalization_id, traj_cluster_hr), by = "hospitalization_id")
 
 
 
