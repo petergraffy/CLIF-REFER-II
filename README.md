@@ -119,9 +119,9 @@ Failure in Adults. in StatPearls (StatPearls Publishing, Treasure Island
 
 ## Current Analysis Direction
 
-The current site-facing analysis is a CLIF federated workflow for early ARF trajectory phenotyping. The primary analysis cohort is adult ICU hospitalizations with invasive mechanical ventilation within 24 hours of first ICU admission. A broader secondary cohort includes IMV, NIPPV, CPAP, or high-flow nasal cannula within 24 hours.
+The current site-facing analysis is a CLIF federated workflow for early ARF trajectory phenotyping. The primary analysis cohort is adult ICU hospitalizations with first evidence of ARF during the ICU stay, including hypoxemia, impaired gas exchange, hypercapnic acidosis, or advanced respiratory support. IMV-only and advanced respiratory support cohorts are retained as sensitivity analyses.
 
-Trajectory phenotypes are built over the first 72 hours after respiratory support initiation using dynamic time warping. Environmental exposures are linked locally by county and admission date, then evaluated through site-level models that can be pooled centrally without exporting patient-level clinical data.
+Trajectory phenotypes are built over the first 72 hours after ARF onset using dynamic time warping and CLIF/mCIDE-aligned respiratory support, oxygenation, ventilation, acid-base, and lung-injury biomarker features. Environmental exposures are linked locally by county and admission date, then evaluated through site-level models that can be pooled centrally without exporting patient-level clinical data.
 
 See [docs/CLIF_FEDERATED_ANALYSIS_PLAN.md](docs/CLIF_FEDERATED_ANALYSIS_PLAN.md) for the planned federated analysis design.
 

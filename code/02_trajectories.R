@@ -1,23 +1,22 @@
 # ================================================================================================
 # ICU Respiratory Failure Environmental Risk (REFER) | PI: Peter Graffy
-# Trajectory Cohort Builder (CLIF) — Primary + Secondary Respiratory Support Cohorts
+# Trajectory Cohort Builder (CLIF) - ARF-wide + Respiratory Support Sensitivity Cohorts
 #
-# Primary cohort   : Adults (>=18) with IMV start within +24h of first ICU admit (t0 = IMV start)
-# Secondary cohort : Adults (>=18) with ADVANCED support start within +24h of first ICU admit
-#                   (ADVANCED = IMV, NIPPV, CPAP, High Flow NC; t0 = first advanced start)
+# Primary cohort   : Adults (>=18) with first evidence of ARF during ICU (t0 = ARF onset)
+# Sensitivity      : IMV and ADVANCED respiratory support cohorts retained for comparison
 #
 # Outputs (written to output/run_[SITE]_[DATE]/):
-#   cohort_primary_imv72.csv            : 1 row / hospitalization (t0 = IMV start; traj window 0–72h)
-#   cohort_secondary_adv72.csv          : 1 row / hospitalization (t0 = first advanced start; 0–72h)
-#   exclusion_primary_imv72.csv         : exclusions + first failing reason (primary)
-#   exclusion_secondary_adv72.csv       : exclusions + first failing reason (secondary)
-#   flow_primary_imv72.csv              : flow counts (primary)
-#   flow_secondary_adv72.csv            : flow counts (secondary)
+#   cohort_arf72.csv                    : 1 row / hospitalization (t0 = first ARF evidence)
+#   cohort_primary_imv72.csv            : sensitivity cohort (t0 = IMV start)
+#   cohort_secondary_adv72.csv          : sensitivity cohort (t0 = first advanced start)
+#   exclusion_*.csv                     : exclusions + first failing reason
+#   flow_*.csv                          : flow counts
 #
 # Notes:
-# - No ABG/SpO2-density inclusion rule (avoid measurement-intensity selection bias for trajectories)
-# - No ICU LOS >= 24h rule (allow early deaths/extubations; handle as censoring downstream)
-# - Optional: require minimum respiratory_support density post-t0 (set MIN_RS_HOURS > 0)
+# - ARF-wide primary cohort avoids selecting only patients who receive IMV.
+# - Evidence source flags are retained for transparent sensitivity analyses.
+# - No ICU LOS >= 24h rule (allow early deaths/extubations; handle as censoring downstream).
+# - Optional: require minimum respiratory_support density post-t0 (set MIN_RS_HOURS > 0).
 # ================================================================================================
 
 pkgs <- c("tidyverse", "lubridate", "data.table", "dtwclust", "RcppRoll", "zoo", "ggplot2")
@@ -89,22 +88,23 @@ trajectory_out_dir <- if (exists("out_dir")) out_dir else file.path(repo_root, "
 trajectory_fig_dir <- file.path(trajectory_out_dir, "figures")
 dir.create(trajectory_fig_dir, recursive = TRUE, showWarnings = FALSE)
 
-cohort_use <- cohort_primary   # or cohort_secondary
+cohort_use <- if (exists("cohort_arf")) cohort_arf else cohort_secondary
 H <- 72
 bin_unit <- "hour"
 
 feat_spec <- list(
-  fio2 = list(col = "fio2_set", prefer = c("fio2_set")),
-  peep = list(col = "peep", prefer = c("peep_set", "peep_obs"))
-)
-
-# Optional additional features once you see coverage:
-feat_spec <- list(
   fio2 = list(col = "fio2", prefer = c("fio2_set")),
   peep = list(col = "peep", prefer = c("peep_set","peep_obs")),
-  plat = list(col = "plat", prefer = c("plateau_pressure_obs")),
+  pplat = list(col = "pplat", prefer = c("plateau_pressure_obs")),
+  pip = list(col = "pip", prefer = c("peak_inspiratory_pressure_obs","peak_inspiratory_pressure_set")),
+  mapaw = list(col = "mapaw", prefer = c("mean_airway_pressure_obs")),
   mv   = list(col = "mv",   prefer = c("minute_vent_obs")),
-  rr   = list(col = "rr",   prefer = c("resp_rate_obs","resp_rate_set"))
+  rr   = list(col = "rr",   prefer = c("resp_rate_obs","resp_rate_set")),
+  vt   = list(col = "vt",   prefer = c("tidal_volume_obs","tidal_volume_set")),
+  pc   = list(col = "pc",   prefer = c("pressure_control_set")),
+  ps   = list(col = "ps",   prefer = c("pressure_support_set")),
+  lpm  = list(col = "lpm",  prefer = c("lpm_set")),
+  flow_rate = list(col = "flow_rate", prefer = c("flow_rate_set"))
 )
 
 
@@ -118,7 +118,7 @@ build_rs_hourly <- function(cohort_df, clif_tables, H = 72, bin_unit = "hour",
   stopifnot(all(c("hospitalization_id","t0") %in% names(cohort_df)))
   
   prefer_cols <- unique(unlist(lapply(feat_spec, `[[`, "prefer")))
-  keep_cols <- unique(c("hospitalization_id","recorded_dttm", prefer_cols))
+  keep_cols <- unique(c("hospitalization_id","recorded_dttm","device_category","mode_category", prefer_cols))
   keep_cols <- intersect(keep_cols, names(rs))
   
   rs <- rs %>% select(all_of(keep_cols)) %>%
@@ -132,6 +132,26 @@ build_rs_hourly <- function(cohort_df, clif_tables, H = 72, bin_unit = "hour",
     mutate(hour = floor_date(recorded_dttm, unit = bin_unit),
            t = as.integer(difftime(hour, t0, units = "hours"))) %>%
     filter(t >= 0, t <= H)
+
+  df <- df %>%
+    mutate(
+      support_level = case_when(
+        device_category == "Room Air" ~ 0,
+        device_category == "Nasal Cannula" ~ 1,
+        device_category %in% c("Face Mask", "Trach Collar", "Other") ~ 2,
+        device_category %in% c("High Flow NC", "CPAP", "NIPPV") ~ 3,
+        device_category == "IMV" ~ 4,
+        TRUE ~ NA_real_
+      ),
+      any_imv = as.integer(device_category == "IMV"),
+      any_advanced_support = as.integer(device_category %in% c("IMV", "NIPPV", "CPAP", "High Flow NC")),
+      positive_pressure = as.integer(device_category %in% c("IMV", "NIPPV", "CPAP") |
+                                       mode_category %in% c("Assist Control-Volume Control",
+                                                            "Pressure Control",
+                                                            "Pressure-Regulated Volume Control",
+                                                            "SIMV",
+                                                            "Pressure Support/CPAP"))
+    )
   
   # ---- robust fallback feature builder ----
   for (nm in names(feat_spec)) {
@@ -145,12 +165,20 @@ build_rs_hourly <- function(cohort_df, clif_tables, H = 72, bin_unit = "hour",
       cols <- lapply(prefs, function(p) df[[p]])
       df[[nm]] <- suppressWarnings(as.numeric(Reduce(dplyr::coalesce, cols)))
     }
+    if (nm == "fio2") df[[nm]] <- if_else(df[[nm]] > 1.5, df[[nm]] / 100, df[[nm]])
   }
   
   hourly <- df %>%
     group_by(hospitalization_id, t0, hour, t) %>%
-    summarize(across(all_of(names(feat_spec)), ~ median(.x, na.rm = TRUE)),
+    summarize(
+      support_level = max(support_level, na.rm = TRUE),
+      any_imv = as.integer(any(any_imv == 1L, na.rm = TRUE)),
+      any_advanced_support = as.integer(any(any_advanced_support == 1L, na.rm = TRUE)),
+      positive_pressure = as.integer(any(positive_pressure == 1L, na.rm = TRUE)),
+      across(all_of(names(feat_spec)), ~ median(.x, na.rm = TRUE)),
               .groups = "drop")
+  hourly <- hourly %>%
+    mutate(support_level = if_else(is.infinite(support_level), NA_real_, support_level))
   
   grid <- cohort_df %>%
     select(hospitalization_id, t0) %>%
@@ -177,7 +205,8 @@ build_rs_hourly <- function(cohort_df, clif_tables, H = 72, bin_unit = "hour",
   
   hourly_filled <- hourly_full %>%
     group_by(hospitalization_id) %>%
-    mutate(across(all_of(names(feat_spec)), fill_one)) %>%
+    mutate(across(c("support_level", all_of(names(feat_spec))), fill_one),
+           across(c(any_imv, any_advanced_support, positive_pressure), ~ replace_na(.x, 0L))) %>%
     ungroup()
   
   hourly_filled
@@ -193,25 +222,133 @@ rs_hourly <- build_rs_hourly(
   max_locf_gap_hours = 6
 )
 
+build_vitals_hourly <- function(cohort_df, clif_tables, H = 72) {
+  vitals <- clif_tables[["clif_vitals"]] %>%
+    rename_with(tolower)
+  
+  needed <- c("hospitalization_id", "recorded_dttm", "vital_category", "vital_value")
+  if (!all(needed %in% names(vitals))) return(tibble())
+  
+  vitals %>%
+    filter(vital_category %in% c("spo2", "respiratory_rate", "heart_rate", "map")) %>%
+    transmute(
+      hospitalization_id = as.character(hospitalization_id),
+      recorded_dttm = as.POSIXct(recorded_dttm, tz = "UTC"),
+      vital_category,
+      vital_value = suppressWarnings(as.numeric(vital_value))
+    ) %>%
+    inner_join(cohort_df %>% transmute(hospitalization_id = as.character(hospitalization_id),
+                                       t0 = as.POSIXct(t0, tz = "UTC")),
+               by = "hospitalization_id") %>%
+    mutate(t = as.integer(difftime(floor_date(recorded_dttm, "hour"), t0, units = "hours"))) %>%
+    filter(t >= 0, t <= H) %>%
+    group_by(hospitalization_id, t, vital_category) %>%
+    summarize(value = median(vital_value, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = vital_category, values_from = value, names_prefix = "vital_")
+}
+
+build_labs_hourly <- function(cohort_df, clif_tables, H = 72) {
+  labs <- clif_tables[["clif_labs"]] %>%
+    rename_with(tolower)
+  
+  needed <- c("hospitalization_id", "lab_result_dttm", "lab_category")
+  if (!all(needed %in% names(labs))) return(tibble())
+  
+  lab_val_col <- intersect(c("lab_value_numeric", "lab_value"), names(labs))[1]
+  if (is.na(lab_val_col)) return(tibble())
+  
+  lung_labs <- c(
+    "po2_arterial", "pco2_arterial", "ph_arterial", "so2_arterial",
+    "pco2_venous", "ph_venous", "so2_mixed_venous", "so2_central_venous",
+    "bicarbonate", "lactate", "hemoglobin", "wbc", "platelet_count",
+    "crp", "procalcitonin", "ferritin", "ldh"
+  )
+  
+  labs %>%
+    filter(lab_category %in% lung_labs) %>%
+    transmute(
+      hospitalization_id = as.character(hospitalization_id),
+      lab_result_dttm = as.POSIXct(lab_result_dttm, tz = "UTC"),
+      lab_category,
+      lab_value = suppressWarnings(as.numeric(.data[[lab_val_col]]))
+    ) %>%
+    inner_join(cohort_df %>% transmute(hospitalization_id = as.character(hospitalization_id),
+                                       t0 = as.POSIXct(t0, tz = "UTC")),
+               by = "hospitalization_id") %>%
+    mutate(t = as.integer(difftime(floor_date(lab_result_dttm, "hour"), t0, units = "hours"))) %>%
+    filter(t >= 0, t <= H) %>%
+    group_by(hospitalization_id, t, lab_category) %>%
+    summarize(value = median(lab_value, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = lab_category, values_from = value, names_prefix = "lab_")
+}
+
+vitals_hourly <- build_vitals_hourly(cohort_use, clif_tables, H)
+labs_hourly <- build_labs_hourly(cohort_use, clif_tables, H)
+
+add_missing_cols <- function(df, cols) {
+  for (col in setdiff(cols, names(df))) df[[col]] <- NA_real_
+  df
+}
+
+rs_hourly <- rs_hourly %>%
+  mutate(hospitalization_id = as.character(hospitalization_id)) %>%
+  left_join(vitals_hourly, by = c("hospitalization_id", "t")) %>%
+  left_join(labs_hourly, by = c("hospitalization_id", "t")) %>%
+  add_missing_cols(c("vital_spo2", "lab_po2_arterial", "lab_pco2_arterial", "lab_ph_arterial")) %>%
+  mutate(
+    spo2_frac = if_else(!is.na(vital_spo2) & vital_spo2 > 1.5, vital_spo2 / 100, vital_spo2),
+    sf_ratio = if_else(!is.na(spo2_frac) & !is.na(fio2) & fio2 > 0, spo2_frac / fio2, NA_real_),
+    pf_ratio = if_else(!is.na(lab_po2_arterial) & !is.na(fio2) & fio2 > 0, lab_po2_arterial / fio2, NA_real_),
+    ventilatory_acidosis = as.numeric(!is.na(lab_pco2_arterial) & !is.na(lab_ph_arterial) &
+                                        lab_pco2_arterial >= 45 & lab_ph_arterial < 7.35)
+  )
+
 rs_hourly %>% glimpse()
+
+candidate_feats <- c(
+  "support_level", "any_imv", "any_advanced_support", "positive_pressure",
+  "fio2", "peep", "pplat", "pip", "mapaw", "mv", "rr", "vt", "pc", "ps",
+  "lpm", "flow_rate", "vital_spo2", "vital_respiratory_rate", "vital_heart_rate",
+  "vital_map", "sf_ratio", "pf_ratio", "lab_po2_arterial", "lab_pco2_arterial",
+  "lab_ph_arterial", "lab_so2_arterial", "lab_bicarbonate", "lab_lactate",
+  "lab_hemoglobin", "lab_wbc", "lab_platelet_count", "lab_crp",
+  "lab_procalcitonin", "lab_ferritin", "lab_ldh", "ventilatory_acidosis"
+)
+candidate_feats <- intersect(candidate_feats, names(rs_hourly))
+
+feature_coverage <- rs_hourly %>%
+  summarize(across(all_of(candidate_feats), ~ mean(!is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "coverage") %>%
+  arrange(desc(coverage), feature)
+
+print(feature_coverage)
+write_csv(feature_coverage, file.path(trajectory_out_dir, "trajectory_feature_coverage.csv"))
+
+required_feats <- c("support_level", "fio2", "vital_spo2", "sf_ratio")
+coverage_selected <- feature_coverage %>%
+  filter(coverage >= 0.20) %>%
+  pull(feature)
+feats <- unique(c(required_feats[required_feats %in% candidate_feats], coverage_selected))
+
+if (length(feats) < 3) {
+  stop("Fewer than 3 trajectory features passed coverage checks. Review CLIF mappings and feature coverage output.")
+}
+
+cat("DTW feature set: ", paste(feats, collapse = ", "), "\n", sep = "")
 
 qc <- rs_hourly %>%
   group_by(hospitalization_id) %>%
   summarize(
     n_t = n(),
-    fio2_obs = sum(!is.na(fio2)),
-    peep_obs = sum(!is.na(peep)),
-    plat_obs = sum(!is.na(plat)),
-    mv_obs = sum(!is.na(mv)),
-    rr_obs = sum(!is.na(rr)),
-    frac_complete = mean(!is.na(fio2) & !is.na(peep) & !is.na(plat) & !is.na(mv) & !is.na(rr)),
+    frac_any_na = mean(if_any(all_of(feats), is.na)),
+    frac_all_na = mean(if_all(all_of(feats), is.na)),
     .groups = "drop"
   )
 
-summary(qc$frac_complete)
+summary(qc$frac_any_na)
 
-# Recommended filter: >= 0.6 of hours have both (fio2, peep)
-keep_ids <- qc %>% filter(frac_complete >= 0.60) %>% pull(hospitalization_id)
+MAX_FRAC_ANY_NA <- 0.60
+keep_ids <- qc %>% filter(frac_any_na <= MAX_FRAC_ANY_NA) %>% pull(hospitalization_id)
 
 rs_hourly_keep <- rs_hourly %>% filter(hospitalization_id %in% keep_ids)
 length(unique(rs_hourly_keep$hospitalization_id))
@@ -221,6 +358,7 @@ make_series_list <- function(rs_hourly_long, feats = c("fio2","peep"), H = 72) {
   # global scaling parameters (across all patients/timepoints)
   mu <- rs_hourly_long %>% summarize(across(all_of(feats), ~ mean(.x, na.rm = TRUE)))
   sdv <- rs_hourly_long %>% summarize(across(all_of(feats), ~ sd(.x, na.rm = TRUE)))
+  sdv <- sdv %>% mutate(across(everything(), ~ if_else(is.na(.x) | .x == 0, 1, .x)))
   
   rs_scaled <- rs_hourly_long %>%
     mutate(across(all_of(feats), ~ (.x - as.numeric(mu[[cur_column()]])) /
@@ -254,9 +392,6 @@ make_series_list <- function(rs_hourly_long, feats = c("fio2","peep"), H = 72) {
 # DTW-safe filter + impute
 # =========================
 
-# 1) choose features (must match your build_rs_hourly feat_spec output names)
-feats <- c("fio2", "peep", "plat", "mv", "rr")
-
 # 2) QC missingness by hospitalization
 na_qc <- rs_hourly_keep %>%
   group_by(hospitalization_id) %>%
@@ -267,10 +402,6 @@ na_qc <- rs_hourly_keep %>%
     frac_all_na = mean(if_all(all_of(feats), is.na)),
     .groups = "drop"
   )
-
-# 3) filter rule (tune as needed)
-#    keep patients where <=40% of hourly rows have any NA across feats
-MAX_FRAC_ANY_NA <- 0.40
 
 keep_ids2 <- na_qc %>%
   filter(frac_any_na <= MAX_FRAC_ANY_NA) %>%
@@ -369,7 +500,7 @@ plot_proto <- function(df, y, ylab, ylim_min, ylim_max) {
 
 p1<-plot_proto(plot_df, "fio2", "FiO2", 0.21, 1.0)
 p2<-plot_proto(plot_df, "peep", "PEEP (cmH2O)", 0, 20)
-p3<-plot_proto(plot_df, "plat", "Plateau Pressure (cmH2O)", 0, 40)
+p3<-plot_proto(plot_df, "pplat", "Plateau Pressure (cmH2O)", 0, 40)
 p4<-plot_proto(plot_df, "mv", "Minute Ventilation (L/min)", 4, 18)
 p5<-plot_proto(plot_df, "rr", "Respiratory Rate (breaths/min)", 10, 40)
 
@@ -388,11 +519,11 @@ print(fig5_titled)
 ggsave(file.path(trajectory_fig_dir, "traj_5panel_clusters.png"),
        fig5_titled, width = 14, height = 15, dpi = 300)
 
-cohort_primary_clusters <- cohort_use %>%
+cohort_clusters <- cohort_use %>%
   mutate(hospitalization_id = as.character(hospitalization_id)) %>%
   left_join(cluster_df, by = "hospitalization_id")
 
-cohort_primary_clusters %>% count(cluster)
+cohort_clusters %>% count(cluster)
 
 suppressPackageStartupMessages({
   library(tidyverse)
@@ -400,7 +531,7 @@ suppressPackageStartupMessages({
 })
 
 # ---- choose features you clustered/plot ----
-feats_main <- c("fio2","peep","plat","mv","rr")
+feats_main <- feats
 
 # helper: compute slope of y ~ t
 slope_lm <- function(t, y) {
@@ -923,6 +1054,7 @@ ggplot(pred_df,
     title = "Predicted ARF Trajectory Cluster by NO2 Exposure"
   ) +
   theme_minimal(base_size = 14)
+
 
 
 

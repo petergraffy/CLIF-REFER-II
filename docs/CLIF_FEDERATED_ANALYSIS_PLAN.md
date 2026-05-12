@@ -2,7 +2,7 @@
 
 ## Project Frame
 
-REFER-II will phenotype acute respiratory failure trajectories among adult ICU patients using CLIF respiratory support, vital sign, laboratory, and hospitalization tables. The primary trajectory window is 0-72 hours after respiratory support initiation. Dynamic time warping will be used to identify trajectory phenotypes that are clinically interpretable, prognostically useful, and suitable for federated evaluation across CLIF sites.
+REFER-II will phenotype acute respiratory failure trajectories among adult ICU patients using CLIF respiratory support, vital sign, laboratory, and hospitalization tables. The primary trajectory window is 0-72 hours after first evidence of ARF, not only after invasive mechanical ventilation. Dynamic time warping will be used to identify trajectory phenotypes that are clinically interpretable, prognostically useful, and suitable for federated evaluation across CLIF sites.
 
 The environmental aim will evaluate whether chronic or recent ambient exposures are associated with trajectory phenotype membership and with outcomes conditional on phenotype.
 
@@ -14,19 +14,27 @@ Patient-level clinical data stay at each site. Sites run the same versioned scri
 
 ### Primary Cohort
 
-Adult ICU hospitalizations from 2018-2024 with invasive mechanical ventilation starting within 24 hours of first ICU admission.
+Adult ICU hospitalizations from 2018-2024 with first evidence of ARF during an ICU stay.
 
-- Index time: first IMV record, `t0`.
+- Index time: earliest qualifying ARF evidence, `t0`.
 - Trajectory window: `t0` through `t0 + 72h`.
-- Rationale: high specificity for severe ARF and dense respiratory support measurements.
+- ARF evidence sources: advanced respiratory support, SpO2 <90%, PaO2 <=60 on room air, P/F ratio <=300, or hypercapnic acidosis with PaCO2 >=45 and arterial pH <7.35.
+- Rationale: captures the full ARF spectrum, including patients who deteriorate without IMV and patients whose early phenotype is defined by oxygenation, ventilation, or acid-base abnormalities.
 
 ### Secondary Cohort
 
-Adult ICU hospitalizations from 2018-2024 with advanced respiratory support starting within 24 hours of first ICU admission.
+Adult ICU hospitalizations from 2018-2024 with advanced respiratory support starting during the ICU stay.
 
 - Advanced support: IMV, NIPPV, CPAP, or high-flow nasal cannula.
 - Index time: first advanced support record, `t0`.
-- Rationale: broader ARF phenotype and sensitivity analysis for support escalation before intubation.
+- Rationale: sensitivity analysis for support escalation before intubation.
+
+### IMV Sensitivity Cohort
+
+Adult ICU hospitalizations from 2018-2024 with invasive mechanical ventilation during the ICU stay.
+
+- Index time: first IMV record, `t0`.
+- Rationale: high-specificity severe ARF sensitivity analysis and comparison with prior ventilator-centered workflows.
 
 ### Sensitivity Cohorts
 
@@ -53,29 +61,55 @@ Additional tables for outcomes and adjustment:
 
 ## Trajectory Features
 
-Core DTW features for the 0-72 hour window:
+Candidate DTW features for the 0-72 hour window:
 
+- respiratory support intensity ordinal
+- IMV indicator
+- advanced support indicator
+- positive pressure indicator
 - FiO2
+- liters per minute
+- high-flow flow rate
 - PEEP
+- peak inspiratory pressure
 - plateau pressure
+- mean airway pressure
+- pressure control
+- pressure support
+- tidal volume
 - minute ventilation
 - respiratory rate
-
-Secondary descriptive features:
-
 - SpO2
 - SpO2/FiO2 ratio
 - PaO2
 - PaO2/FiO2 ratio
+- PaCO2
+- arterial pH
+- arterial oxygen saturation
+- bicarbonate
+- lactate
+- hemoglobin
+- WBC
+- platelet count
+- CRP
+- procalcitonin
+- ferritin
+- LDH
+- hypercapnic acidosis indicator
+
+Secondary descriptive features:
+
 - respiratory support state transitions
 - death or discharge before 72 hours as competing events
 
 Feature processing:
 
-- Bin measurements hourly from `t0`.
+- Use CLIF 2.1.0 fields and mCIDE categories as the canonical variable vocabulary.
+- Bin measurements hourly from ARF `t0`.
 - Aggregate multiple values per hour using median for continuous variables and dominant state for categorical support.
 - Normalize FiO2 to a consistent fraction or percent scale before modeling.
 - Track observedness before imputation.
+- Select DTW features by pre-specified clinical priority plus minimum site-level coverage, preserving feature coverage as an export.
 - Use limited carry-forward/carry-backward only within pre-specified gaps.
 - Impute remaining DTW-required values after preserving missingness QC metrics.
 
@@ -217,7 +251,7 @@ No patient-level rows should leave the site unless an IRB-approved sharing model
 
 ## Open Analytic Decisions
 
-- Whether the primary phenotype model should use IMV-only or advanced support as the main cohort.
+- Whether the primary phenotype model should use all ARF evidence or require either oxygenation/gas-exchange evidence or advanced support evidence.
 - Whether DTW should cluster clinical features only, with exposures modeled afterward, or include exposure histories as part of the distance metric.
 - Whether early death should be represented as an absorbing trajectory state or handled outside the DTW feature matrix.
 - Whether the final phenotype count should prioritize interpretability over internal cluster metrics.

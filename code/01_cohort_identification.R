@@ -1,23 +1,22 @@
 # ================================================================================================
 # ICU Respiratory Failure Environmental Risk (REFER) | PI: Peter Graffy
-# Trajectory Cohort Builder (CLIF) — Primary + Secondary Respiratory Support Cohorts
+# Trajectory Cohort Builder (CLIF) - ARF-wide + Respiratory Support Sensitivity Cohorts
 #
-# Primary cohort   : Adults (>=18) with IMV start within +24h of first ICU admit (t0 = IMV start)
-# Secondary cohort : Adults (>=18) with ADVANCED support start within +24h of first ICU admit
-#                   (ADVANCED = IMV, NIPPV, CPAP, High Flow NC; t0 = first advanced start)
+# Primary cohort   : Adults (>=18) with first evidence of ARF during ICU (t0 = ARF onset)
+# Sensitivity      : IMV and ADVANCED respiratory support cohorts retained for comparison
 #
 # Outputs (written to output/run_[SITE]_[DATE]/):
-#   cohort_primary_imv72.csv            : 1 row / hospitalization (t0 = IMV start; traj window 0–72h)
-#   cohort_secondary_adv72.csv          : 1 row / hospitalization (t0 = first advanced start; 0–72h)
-#   exclusion_primary_imv72.csv         : exclusions + first failing reason (primary)
-#   exclusion_secondary_adv72.csv       : exclusions + first failing reason (secondary)
-#   flow_primary_imv72.csv              : flow counts (primary)
-#   flow_secondary_adv72.csv            : flow counts (secondary)
+#   cohort_arf72.csv                    : 1 row / hospitalization (t0 = first ARF evidence)
+#   cohort_primary_imv72.csv            : sensitivity cohort (t0 = IMV start)
+#   cohort_secondary_adv72.csv          : sensitivity cohort (t0 = first advanced start)
+#   exclusion_*.csv                     : exclusions + first failing reason
+#   flow_*.csv                          : flow counts
 #
 # Notes:
-# - No ABG/SpO2-density inclusion rule (avoid measurement-intensity selection bias for trajectories)
-# - No ICU LOS >= 24h rule (allow early deaths/extubations; handle as censoring downstream)
-# - Optional: require minimum respiratory_support density post-t0 (set MIN_RS_HOURS > 0)
+# - ARF-wide primary cohort avoids selecting only patients who receive IMV.
+# - Evidence source flags are retained for transparent sensitivity analyses.
+# - No ICU LOS >= 24h rule (allow early deaths/extubations; handle as censoring downstream).
+# - Optional: require minimum respiratory_support density post-t0 (set MIN_RS_HOURS > 0).
 # ================================================================================================
 
 suppressPackageStartupMessages({
@@ -59,11 +58,20 @@ START_DATE <- as.POSIXct("2018-01-01 00:00:00", tz = "UTC")
 END_DATE   <- as.POSIXct("2024-12-31 23:59:59", tz = "UTC")
 
 ADULT_AGE_YEARS <- 18
-ICU_TO_T0_MAX_H <- 24          # require t0 within +24h of first ICU in
+ICU_TO_T0_MAX_H <- Inf         # include ARF that develops any time during ICU; set 24 for early-onset sensitivity
 TRAJ_HOURS      <- 72          # trajectory window length [t0, t0 + 72h]
 PRE_T0_BUFFER_H <- 0           # keep 0 by default; set >0 if you want a short pre-t0 baseline window
-MIN_RS_HOURS    <- 6           # minimum hours with respiratory_support observations in [t0, t0+72h]
+MIN_RS_HOURS    <- 0           # avoid excluding lab/vital-defined ARF before device escalation
 # set to 0 to disable
+
+FIO2_JOIN_H     <- 1
+HYPERCAP_JOIN_H <- 2
+ROOM_AIR_FIO2   <- 0.21
+SPO2_ARF_CUTOFF <- 90
+PAO2_ARF_CUTOFF <- 60
+PF_ARF_CUTOFF   <- 300
+PCO2_ARF_CUTOFF <- 45
+PH_ARF_CUTOFF   <- 7.35
 
 # Device categories (per your screenshot)
 DEVICE_IMV      <- "IMV"
@@ -93,7 +101,7 @@ base_no_ext <- tools::file_path_sans_ext(tolower(bn))
 base_norm <- ifelse(looks_clif, base_no_ext, paste0("clif_", base_no_ext))
 found_map <- stats::setNames(all_files, base_norm)
 
-required_raw <- c("patient","hospitalization","adt","respiratory_support")
+required_raw <- c("patient","hospitalization","adt","respiratory_support","vitals","labs")
 required_files <- paste0("clif_", required_raw)
 missing <- setdiff(required_files, names(found_map))
 if (length(missing) > 0) {
@@ -133,8 +141,10 @@ get_min <- function(tbl_name, cols) {
   nm <- paste0("clif_", tbl_name)
   stopifnot(!is.null(clif_tables[[nm]]))
   out <- clif_tables[[nm]] %>% rename_with(tolower)
-  cols_keep <- intersect(tolower(cols), names(out))
-  out %>% dplyr::select(any_of(cols_keep))
+  cols <- tolower(cols)
+  missing_cols <- setdiff(cols, names(out))
+  for (missing_col in missing_cols) out[[missing_col]] <- NA
+  out %>% dplyr::select(all_of(cols))
 }
 
 keep_any <- function(df, cols) dplyr::select(df, any_of(intersect(cols, names(df))))
@@ -160,14 +170,40 @@ adt <- get_min("adt",
   )
 
 resp_support <- get_min("respiratory_support",
-                        c("hospitalization_id","recorded_dttm","device_category","mode_category","fio2_set",
+                        c("hospitalization_id","recorded_dttm","device_category","device_name",
+                          "mode_category","mode_name","fio2_set","lpm_set","flow_rate_set",
                           "peep_set","peep_obs","tidal_volume_set","tidal_volume_obs",
-                          "plateau_pressure_obs","peak_inspiratory_pressure_obs",
-                          "minute_vent_obs","resp_rate_set","resp_rate_obs")) %>%
+                          "resp_rate_set","resp_rate_obs","plateau_pressure_obs",
+                          "peak_inspiratory_pressure_set","peak_inspiratory_pressure_obs",
+                          "mean_airway_pressure_obs","minute_vent_obs",
+                          "pressure_control_set","pressure_support_set",
+                          "tracheostomy","artificial_airway")) %>%
   mutate(
     recorded_dttm = safe_posix(recorded_dttm),
     device_category = as.character(device_category),
     mode_category   = as.character(mode_category)
+  )
+
+vitals <- get_min("vitals",
+                  c("hospitalization_id","recorded_dttm","vital_category","vital_name",
+                    "vital_value","meas_site_name")) %>%
+  mutate(
+    recorded_dttm = safe_posix(recorded_dttm),
+    vital_category = as.character(vital_category),
+    vital_name = as.character(vital_name),
+    vital_value = suppressWarnings(as.numeric(vital_value))
+  )
+
+labs <- get_min("labs",
+                c("hospitalization_id","lab_result_dttm","lab_collect_dttm",
+                  "lab_category","lab_name","lab_value","lab_value_numeric",
+                  "reference_unit","lab_specimen_category")) %>%
+  mutate(
+    lab_result_dttm = safe_posix(lab_result_dttm),
+    lab_collect_dttm = safe_posix(lab_collect_dttm),
+    lab_category = as.character(lab_category),
+    lab_name = as.character(lab_name),
+    lab_value_num = suppressWarnings(as.numeric(coalesce(lab_value_numeric, lab_value)))
   )
 
 # ---------- ICU bounds (first ICU in) ----------
@@ -210,26 +246,143 @@ base <- hospitalization %>%
   )
 
 # ---------- t0 identification ----------
-# First IMV time (primary)
-t0_imv <- resp_support %>%
+normalize_fio2 <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  case_when(
+    is.na(x) ~ NA_real_,
+    x > 1.5 ~ x / 100,
+    TRUE ~ x
+  )
+}
+
+in_icu_window <- function(events, time_col) {
+  events %>%
+    inner_join(base %>% select(hospitalization_id, first_icu_in, last_icu_out),
+               by = "hospitalization_id") %>%
+    filter(.data[[time_col]] >= first_icu_in,
+           .data[[time_col]] <= last_icu_out)
+}
+
+rs_icu <- resp_support %>%
+  mutate(
+    device_category = as.character(device_category),
+    mode_category = as.character(mode_category),
+    fio2 = normalize_fio2(fio2_set)
+  ) %>%
+  in_icu_window("recorded_dttm")
+
+# First IMV time retained as sensitivity cohort.
+t0_imv <- rs_icu %>%
   filter(device_category == DEVICE_IMV) %>%
   group_by(hospitalization_id) %>%
-  summarize(t0 = min(recorded_dttm, na.rm = TRUE), .groups = "drop") %>%
+  summarize(
+    t0 = min(recorded_dttm, na.rm = TRUE),
+    arf_evidence = "imv",
+    .groups = "drop"
+  ) %>%
   mutate(cohort = "primary_imv")
 
-# First advanced support time (secondary)
-t0_adv <- resp_support %>%
+# First advanced support time retained as sensitivity cohort.
+t0_adv <- rs_icu %>%
   filter(device_category %in% DEVICE_ADVANCED) %>%
   group_by(hospitalization_id) %>%
-  summarize(t0 = min(recorded_dttm, na.rm = TRUE), .groups = "drop") %>%
+  summarize(
+    t0 = min(recorded_dttm, na.rm = TRUE),
+    arf_evidence = "advanced_support",
+    .groups = "drop"
+  ) %>%
   mutate(cohort = "secondary_adv")
+
+advanced_events <- rs_icu %>%
+  filter(device_category %in% DEVICE_ADVANCED) %>%
+  transmute(hospitalization_id, t0 = recorded_dttm, arf_evidence = "advanced_support")
+
+spo2_events <- vitals %>%
+  filter(vital_category == "spo2", !is.na(vital_value), vital_value < SPO2_ARF_CUTOFF) %>%
+  in_icu_window("recorded_dttm") %>%
+  transmute(hospitalization_id, t0 = recorded_dttm, arf_evidence = "spo2_lt_90")
+
+lab_events <- labs %>%
+  filter(!is.na(lab_result_dttm), !is.na(lab_value_num)) %>%
+  in_icu_window("lab_result_dttm")
+
+fio2_ref <- rs_icu %>%
+  filter(!is.na(fio2)) %>%
+  transmute(hospitalization_id, fio2_time = recorded_dttm, fio2)
+
+pair_nearest <- function(left_df, left_time, right_df, right_time, max_gap_h) {
+  if (nrow(left_df) == 0 || nrow(right_df) == 0) {
+    out <- bind_cols(left_df[0, , drop = FALSE], right_df[0, setdiff(names(right_df), "hospitalization_id"), drop = FALSE])
+    out$left_time_keep <- as.POSIXct(character())
+    out$gap_h <- numeric()
+    return(out)
+  }
+  left_dt <- as.data.table(left_df)
+  right_dt <- as.data.table(right_df)
+  left_dt[, left_time_keep := get(left_time)]
+  setkeyv(left_dt, c("hospitalization_id", left_time))
+  setkeyv(right_dt, c("hospitalization_id", right_time))
+  out <- right_dt[left_dt, roll = "nearest", nomatch = 0L]
+  out[, gap_h := abs(as.numeric(difftime(left_time_keep, get(right_time), units = "hours")))]
+  as_tibble(out[gap_h <= max_gap_h])
+}
+
+pao2_labs <- lab_events %>%
+  filter(lab_category == "po2_arterial") %>%
+  transmute(hospitalization_id, lab_time = lab_result_dttm, pao2 = lab_value_num)
+
+pao2_fio2 <- pair_nearest(pao2_labs, "lab_time", fio2_ref, "fio2_time", FIO2_JOIN_H)
+
+pf_events <- pao2_fio2 %>%
+  filter(!is.na(pao2), !is.na(fio2), fio2 > 0, pao2 / fio2 <= PF_ARF_CUTOFF) %>%
+  transmute(hospitalization_id, t0 = left_time_keep, arf_evidence = "pf_ratio_le_300")
+
+room_air_pao2_events <- pao2_fio2 %>%
+  filter(!is.na(pao2), !is.na(fio2), fio2 <= ROOM_AIR_FIO2 + 1e-6,
+         pao2 <= PAO2_ARF_CUTOFF) %>%
+  transmute(hospitalization_id, t0 = left_time_keep, arf_evidence = "room_air_pao2_le_60")
+
+pco2_labs <- lab_events %>%
+  filter(lab_category == "pco2_arterial") %>%
+  transmute(hospitalization_id, pco2_time = lab_result_dttm, pco2 = lab_value_num)
+
+ph_labs <- lab_events %>%
+  filter(lab_category == "ph_arterial") %>%
+  transmute(hospitalization_id, ph_time = lab_result_dttm, ph = lab_value_num)
+
+hyper_pairs <- pair_nearest(pco2_labs, "pco2_time", ph_labs, "ph_time", HYPERCAP_JOIN_H)
+
+hyper_events <- hyper_pairs %>%
+  filter(!is.na(pco2), !is.na(ph), pco2 >= PCO2_ARF_CUTOFF, ph < PH_ARF_CUTOFF) %>%
+  transmute(hospitalization_id, t0 = left_time_keep, arf_evidence = "hypercapnic_acidosis")
+
+t0_arf_events <- bind_rows(
+  advanced_events,
+  spo2_events,
+  pf_events,
+  room_air_pao2_events,
+  hyper_events
+) %>%
+  filter(!is.na(t0))
+
+t0_arf <- t0_arf_events %>%
+  group_by(hospitalization_id) %>%
+  arrange(t0, .by_group = TRUE) %>%
+  summarize(
+    t0 = first(t0),
+    arf_evidence = first(arf_evidence),
+    arf_evidence_all = paste(sort(unique(arf_evidence)), collapse = ";"),
+    .groups = "drop"
+  ) %>%
+  mutate(cohort = "arf72")
 
 # ---------- Shared cohort builder ----------
 build_traj_cohort <- function(base_df, t0_df, cohort_tag) {
   
   # join t0 and compute timing rule relative to ICU admit
   df <- base_df %>%
-    inner_join(t0_df %>% select(hospitalization_id, t0), by = "hospitalization_id") %>%
+    left_join(t0_df %>% select(hospitalization_id, t0, any_of(c("arf_evidence", "arf_evidence_all"))),
+              by = "hospitalization_id") %>%
     mutate(
       t0_within_icu24h = as.numeric(difftime(t0, first_icu_in, units = "hours")) <= ICU_TO_T0_MAX_H &
         as.numeric(difftime(t0, first_icu_in, units = "hours")) >= -6  # allow small negative due to timestamp quirks
@@ -250,8 +403,11 @@ build_traj_cohort <- function(base_df, t0_df, cohort_tag) {
     filter(recorded_dttm >= win_start, recorded_dttm <= win_end) %>%
     select(hospitalization_id, recorded_dttm, device_category, mode_category,
            fio2_set, peep_set, peep_obs, tidal_volume_set, tidal_volume_obs,
-           plateau_pressure_obs, peak_inspiratory_pressure_obs, minute_vent_obs,
-           resp_rate_set, resp_rate_obs)
+           lpm_set, flow_rate_set, pressure_control_set, pressure_support_set,
+           plateau_pressure_obs, peak_inspiratory_pressure_set,
+           peak_inspiratory_pressure_obs, mean_airway_pressure_obs,
+           minute_vent_obs, resp_rate_set, resp_rate_obs,
+           tracheostomy, artificial_airway)
   
   # density: number of distinct hours with any RS record in [t0, t0+TRAJ_HOURS]
   rs_density <- rs_win %>%
@@ -284,6 +440,8 @@ build_traj_cohort <- function(base_df, t0_df, cohort_tag) {
       first_icu_in, last_icu_out, icu_los_hours,
       age_years, sex_category, race_category, ethnicity_category,
       census_tract, county_code, zipcode_five_digit, zipcode_nine_digit,
+      arf_evidence = coalesce(arf_evidence, cohort_tag),
+      arf_evidence_all = coalesce(arf_evidence_all, arf_evidence),
       t0,
       data_window_start = t0 - dhours(PRE_T0_BUFFER_H),
       data_window_end   = t0 + dhours(TRAJ_HOURS),
@@ -297,8 +455,8 @@ build_traj_cohort <- function(base_df, t0_df, cohort_tag) {
       !coalesce(adult, FALSE) ~ "Under 18 or missing age",
       !coalesce(has_demo, FALSE) ~ "Missing demographics",
       !coalesce(has_geo, FALSE)  ~ "Missing geo code",
-      is.na(t0) ~ "No qualifying t0 found",
-      !coalesce(t0_within_icu24h, FALSE) ~ "t0 not within +24h of ICU admit",
+      is.na(t0) ~ "No qualifying ARF/support t0 found",
+      !coalesce(t0_within_icu24h, FALSE) ~ "t0 outside configured ICU onset window",
       (MIN_RS_HOURS > 0) & !coalesce(meets_rs_density, FALSE) ~ glue("Insufficient respiratory_support density (<{MIN_RS_HOURS} hourly bins)"),
       TRUE ~ "Other"
     )) %>%
@@ -321,7 +479,8 @@ build_traj_cohort <- function(base_df, t0_df, cohort_tag) {
       glue(">= {ADULT_AGE_YEARS} years"),
       "Demographics present",
       "Geography present",
-      glue("t0 within +{ICU_TO_T0_MAX_H}h of first ICU admit"),
+      if (is.infinite(ICU_TO_T0_MAX_H)) "t0 during ICU stay"
+      else glue("t0 within +{ICU_TO_T0_MAX_H}h of first ICU admit"),
       if (MIN_RS_HOURS <= 0) "Respiratory_support density rule (disabled)"
       else glue(">= {MIN_RS_HOURS} distinct hourly bins in trajectory window")
     ),
@@ -337,24 +496,30 @@ build_traj_cohort <- function(base_df, t0_df, cohort_tag) {
   )
 }
 
-# ---------- Build primary + secondary cohorts ----------
+# ---------- Build ARF-wide primary cohort + support sensitivity cohorts ----------
+res_arf       <- build_traj_cohort(base, t0_arf, "arf72")
 res_primary   <- build_traj_cohort(base, t0_imv, "primary_imv72")
 res_secondary <- build_traj_cohort(base, t0_adv, "secondary_adv72")
 
+cohort_arf       <- res_arf$cohort
 cohort_primary   <- res_primary$cohort
 cohort_secondary <- res_secondary$cohort
 
+excluded_arf       <- res_arf$exclusions
 excluded_primary   <- res_primary$exclusions
 excluded_secondary <- res_secondary$exclusions
 
+flow_arf       <- res_arf$flow
 flow_primary   <- res_primary$flow
 flow_secondary <- res_secondary$flow
 
 # ---------- Quick counts ----------
 cat("\nCohort selection summary:\n")
 cat("  ICU candidates:          ", nrow(base), "\n", sep = "")
-cat("  Primary IMV included:    ", nrow(cohort_primary), "\n", sep = "")
+cat("  ARF-wide included:       ", nrow(cohort_arf), "\n", sep = "")
+cat("  IMV sensitivity included:", nrow(cohort_primary), "\n", sep = "")
 cat("  Secondary ADV included:  ", nrow(cohort_secondary), "\n", sep = "")
+cat("  ARF-wide excluded:       ", nrow(excluded_arf), "\n", sep = "")
 cat("  Primary excluded:        ", nrow(excluded_primary), "\n", sep = "")
 cat("  Secondary excluded:      ", nrow(excluded_secondary), "\n", sep = "")
 
@@ -377,27 +542,34 @@ out_dir <- file.path(repo, "output", paste0("run_", SITE_NAME, "_", SYSTEM_DATE)
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 # cohorts
+write_csv(cohort_arf,       file.path(out_dir, make_name("cohort_arf72")))
 write_csv(cohort_primary,   file.path(out_dir, make_name("cohort_primary_imv72")))
 write_csv(cohort_secondary, file.path(out_dir, make_name("cohort_secondary_adv72")))
 
 # exclusions
+write_csv(excluded_arf,       file.path(out_dir, make_name("exclusion_arf72")))
 write_csv(excluded_primary,   file.path(out_dir, make_name("exclusion_primary_imv72")))
 write_csv(excluded_secondary, file.path(out_dir, make_name("exclusion_secondary_adv72")))
 
 # flow
+write_csv(flow_arf,       file.path(out_dir, make_name("flow_arf72")))
 write_csv(flow_primary,   file.path(out_dir, make_name("flow_primary_imv72")))
 write_csv(flow_secondary, file.path(out_dir, make_name("flow_secondary_adv72")))
 
 cat("\nSaved outputs to: ", out_dir, "\n", sep = "")
+cat("  - ", make_name("cohort_arf72"), "\n", sep = "")
 cat("  - ", make_name("cohort_primary_imv72"), "\n", sep = "")
 cat("  - ", make_name("cohort_secondary_adv72"), "\n", sep = "")
+cat("  - ", make_name("exclusion_arf72"), "\n", sep = "")
 cat("  - ", make_name("exclusion_primary_imv72"), "\n", sep = "")
 cat("  - ", make_name("exclusion_secondary_adv72"), "\n", sep = "")
+cat("  - ", make_name("flow_arf72"), "\n", sep = "")
 cat("  - ", make_name("flow_primary_imv72"), "\n", sep = "")
 cat("  - ", make_name("flow_secondary_adv72"), "\n", sep = "")
 
 # ---------- Optional: keep minimal objects ----------
-keep_vars <- c("clif_tables", "cohort_primary", "cohort_secondary", "repo", "out_dir")
+keep_vars <- c("clif_tables", "cohort_arf", "cohort_primary", "cohort_secondary", "repo", "out_dir")
 rm(list = setdiff(ls(envir = .GlobalEnv), keep_vars), envir = .GlobalEnv)
 
 message("\nCohort identification complete.")
+
