@@ -117,6 +117,14 @@ Respiratory Failure: The RENOVATE Randomized Clinical Trial. JAMA 333,
 Failure in Adults. in StatPearls (StatPearls Publishing, Treasure Island
 (FL), 2025).
 
+## Current Analysis Direction
+
+The current site-facing analysis is a CLIF federated workflow for early ARF trajectory phenotyping. The primary analysis cohort is adult ICU hospitalizations with invasive mechanical ventilation within 24 hours of first ICU admission. A broader secondary cohort includes IMV, NIPPV, CPAP, or high-flow nasal cannula within 24 hours.
+
+Trajectory phenotypes are built over the first 72 hours after respiratory support initiation using dynamic time warping. Environmental exposures are linked locally by county and admission date, then evaluated through site-level models that can be pooled centrally without exporting patient-level clinical data.
+
+See [docs/CLIF_FEDERATED_ANALYSIS_PLAN.md](docs/CLIF_FEDERATED_ANALYSIS_PLAN.md) for the planned federated analysis design.
+
 ## Detailed Instructions for running the project
 
 ## 1. Update `config/config.json`
@@ -125,11 +133,18 @@ Follow instructions in the [config/README.md](config/README.md) file for detaile
 
 ## 2. Set up the project environment
 
-Initialize the R environment. Run `00_renv_restore.R` in the [code](code/templates/R) to set up the project environment.
+Initialize the R environment. Run `00_renv_restore.R` in the [code](code) directory to set up the project environment.
 
 Unzip the `acs_estimates.csv.zip` file in the exposome folder and save it there.
 
 ## 3. Run code
 
-Detailed instructions on the code workflow are provided in the [code directory](code/README.md)
+Detailed instructions on the current code workflow are provided in the [code directory](code/README.md).
+
+Current canonical scripts:
+
+1. `code/01_cohort_identification.R`
+2. `code/02_trajectories.R`
+
+Older exploratory scripts are preserved in `code/archive/` for provenance but are not current entry points.
 

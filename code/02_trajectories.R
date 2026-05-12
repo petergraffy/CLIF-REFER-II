@@ -34,8 +34,10 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(cowplot)
   library(dplyr)
+  library(ggalluvial)
 })
 
+# ---------- File discovery / loading ----------
 exts <- strsplit(file_type, "[/|,; ]+")[[1]]
 exts <- exts[nzchar(exts)]
 if (length(exts) == 0) exts <- c("csv","parquet","fst")
@@ -59,8 +61,15 @@ base_no_ext <- tools::file_path_sans_ext(tolower(bn))
 base_norm <- ifelse(looks_clif, base_no_ext, paste0("clif_", base_no_ext))
 found_map <- stats::setNames(all_files, base_norm)
 
+required_raw <- c("patient","hospitalization","adt","respiratory_support","vitals","labs")
+required_files <- paste0("clif_", required_raw)
+missing <- setdiff(required_files, names(found_map))
+if (length(missing) > 0) {
+  cat("Detected CLIF-like files:\n"); print(sort(unique(names(found_map))))
+  stop("Missing required tables: ", paste(missing, collapse = ", "))
+}
 
-clif_paths <- found_map
+clif_paths <- found_map[required_files]
 
 read_any <- function(path) {
   ext <- tolower(tools::file_ext(path))
@@ -72,7 +81,13 @@ read_any <- function(path) {
 }
 
 clif_tables <- lapply(clif_paths, read_any)
+names(clif_tables) <- required_files
 cat("Loaded tables: ", paste(names(clif_tables), collapse = ", "), "\n")
+
+repo_root <- if (exists("repo")) repo else getwd()
+trajectory_out_dir <- if (exists("out_dir")) out_dir else file.path(repo_root, "output", "trajectory_run")
+trajectory_fig_dir <- file.path(trajectory_out_dir, "figures")
+dir.create(trajectory_fig_dir, recursive = TRUE, showWarnings = FALSE)
 
 cohort_use <- cohort_primary   # or cohort_secondary
 H <- 72
@@ -370,7 +385,8 @@ fig5_titled <- cowplot::ggdraw(fig5) +
 print(fig5_titled)
 
 # ---- 4) Save ----
-ggsave("traj_5panel_clusters.png", fig5_titled, width = 14, height = 15, dpi = 300)
+ggsave(file.path(trajectory_fig_dir, "traj_5panel_clusters.png"),
+       fig5_titled, width = 14, height = 15, dpi = 300)
 
 cohort_primary_clusters <- cohort_use %>%
   mutate(hospitalization_id = as.character(hospitalization_id)) %>%
@@ -496,28 +512,417 @@ rs_plus_spo2 <- rs_hourly_dtw_imp %>%
     sf_ratio = ifelse(!is.na(spo2_frac) & !is.na(fio2) & fio2 > 0, spo2_frac / fio2, NA_real_)
   )
 
+plot_df2 <- rs_plus_spo2 %>%
+  inner_join(cluster_df %>% mutate(hospitalization_id = as.character(hospitalization_id)),
+             by = "hospitalization_id")
+
+# Examples:
+p6<-plot_proto(plot_df2, "spo2_frac", "SpO2 (fraction)", 0.70, 1.00)
+p7<-plot_proto(plot_df2, "sf_ratio", "S/F (SpO2/FiO2)", 1.0, 4.5)
+
+# Find likely category names at your site first (one-time):
+sort(unique(tolower(vitals$vital_category)))[1:50]
+
+# Adjust these if your site uses different strings
+ht_cats <- c("height_cm","height")
+wt_cats <- c("weight_kg","weight")
+
+hw_baseline <- vitals %>%
+  mutate(vital_category = tolower(vital_category)) %>%
+  filter(vital_category %in% c(ht_cats, wt_cats)) %>%
+  transmute(
+    hospitalization_id = as.character(hospitalization_id),
+    recorded_dttm = as.POSIXct(recorded_dttm, tz="UTC"),
+    vital_category,
+    value = suppressWarnings(as.numeric(vital_value))
+  ) %>%
+  inner_join(cohort_use %>% transmute(hospitalization_id = as.character(hospitalization_id),
+                                      t0 = as.POSIXct(t0, tz="UTC")),
+             by = "hospitalization_id") %>%
+  mutate(dt_h = abs(as.numeric(difftime(recorded_dttm, t0, units="hours")))) %>%
+  filter(dt_h <= 24) %>%
+  group_by(hospitalization_id, vital_category) %>%
+  slice_min(order_by = dt_h, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(vital_category = case_when(
+    vital_category %in% ht_cats ~ "height_cm",
+    vital_category %in% wt_cats ~ "weight_kg",
+    TRUE ~ vital_category
+  )) %>%
+  select(hospitalization_id, vital_category, value) %>%
+  pivot_wider(names_from = vital_category, values_from = value)
+
+# join onto traj_summary or cohort
+traj_summary2 <- traj_summary %>%
+  mutate(hospitalization_id = as.character(hospitalization_id)) %>%
+  left_join(hw_baseline, by = "hospitalization_id")
+
+labs <- clif_tables[["clif_labs"]] %>% rename_with(tolower)
+stopifnot(all(c("hospitalization_id","lab_result_dttm","lab_category") %in% names(labs)))
+
+# pick numeric value column name (varies by export)
+lab_val_col <- intersect(c("lab_value_numeric","lab_value"), names(labs))[1]
+stopifnot(!is.na(lab_val_col))
+
+pao2_hourly <- labs %>%
+  filter(tolower(lab_category) %in% c("po2_arterial","pao2","po2")) %>%
+  transmute(
+    hospitalization_id = as.character(hospitalization_id),
+    lab_result_dttm = as.POSIXct(lab_result_dttm, tz="UTC"),
+    pao2 = suppressWarnings(as.numeric(.data[[lab_val_col]]))
+  ) %>%
+  inner_join(cohort_use %>% transmute(hospitalization_id = as.character(hospitalization_id),
+                                      t0 = as.POSIXct(t0, tz="UTC")),
+             by = "hospitalization_id") %>%
+  mutate(
+    hour = floor_date(lab_result_dttm, "hour"),
+    t = as.integer(difftime(hour, t0, units="hours"))
+  ) %>%
+  filter(t >= 0, t <= H) %>%
+  group_by(hospitalization_id, t) %>%
+  summarize(pao2 = median(pao2, na.rm = TRUE), .groups = "drop")
+
+rs_plus_abg <- rs_plus_spo2 %>%
+  left_join(pao2_hourly, by = c("hospitalization_id","t")) %>%
+  mutate(
+    pf_ratio = ifelse(!is.na(pao2) & !is.na(fio2) & fio2 > 0, pao2 / fio2, NA_real_)
+  )
+
+# plot PF only if it looks sane
+plot_df3 <- rs_plus_abg %>%
+  inner_join(cluster_df %>% mutate(hospitalization_id = as.character(hospitalization_id)),
+             by = "hospitalization_id")
+
+p8<-plot_proto(plot_df3, "pao2", "PaO2 (mmHg)", 40, 200)
+p9<-plot_proto(plot_df3, "pf_ratio", "P/F ratio", 50, 400)
 
 
 
 
+cut_points   <- c(0, 12, 24, 48, 72)
+block_labels <- c("0-12","12-24","24-48","48-72")
+
+collapse_device <- function(x) {
+  x <- as.character(x)
+  x <- ifelse(is.na(x) | !nzchar(trimws(x)), NA_character_, x)
+  case_when(
+    x %in% c("Nasal Cannula", "Face Mask") ~ "Low Flow O2",
+    x %in% c("CPAP", "NIPPV")             ~ "NIV (CPAP/NIPPV)",
+    x %in% c("High Flow NC")              ~ "HFNC",
+    x %in% c("IMV")                       ~ "IMV",
+    x %in% c("Trach Collar")              ~ "Trach Collar",
+    x %in% c("Room Air")                  ~ "Room Air",
+    TRUE                                  ~ x
+  )
+}
+
+# -----------------------------
+# 1) Build death time using discharge_category + discharge_dttm
+# -----------------------------
+hosp <- clif_tables[["clif_hospitalization"]] %>% rename_with(tolower)
+
+stopifnot(all(c("hospitalization_id", "discharge_dttm", "discharge_category") %in% names(hosp)))
+
+death_map <- hosp %>%
+  transmute(
+    hospitalization_id = as.character(hospitalization_id),
+    discharge_dttm = as.POSIXct(discharge_dttm, tz = "UTC"),
+    discharge_category = tolower(trimws(as.character(discharge_category)))
+  ) %>%
+  mutate(
+    died_or_hospice = discharge_category %in% c("expired", "hospice"),
+    death_dttm = ifelse(died_or_hospice, discharge_dttm, as.POSIXct(NA, tz = "UTC"))
+  ) %>%
+  mutate(death_dttm = as.POSIXct(death_dttm, origin = "1970-01-01", tz = "UTC")) %>%
+  select(hospitalization_id, death_dttm, died_or_hospice)
+
+# -----------------------------
+# 2) Add death timing (hours from t0)
+# -----------------------------
+cohort_key <- cohort_use %>%
+  transmute(
+    hospitalization_id = as.character(hospitalization_id),
+    t0 = as.POSIXct(t0, tz = "UTC")
+  ) %>%
+  left_join(death_map, by = "hospitalization_id") %>%
+  mutate(
+    death_h = ifelse(!is.na(death_dttm),
+                     as.numeric(difftime(death_dttm, t0, units = "hours")),
+                     NA_real_)
+  )
+
+
+grid_blocks <- cohort_key %>%
+  tidyr::expand_grid(block = factor(block_labels, levels = block_labels)) %>%
+  mutate(
+    block_start = c(0, 12, 24, 48)[match(block, block_labels)],
+    block_end   = c(12, 24, 48, 72)[match(block, block_labels)],
+    # death occurs within this block
+    death_in_block = !is.na(death_h) & death_h >= block_start & death_h < block_end,
+    # already dead at the start of this block
+    dead_before_block = !is.na(death_h) & death_h < block_start
+  )
+
+# -----------------------------
+# 3) Dominant respiratory support state per block (if any rows exist)
+# -----------------------------
+rs_raw <- clif_tables[["clif_respiratory_support"]] %>% rename_with(tolower)
+
+rs_block_dom <- rs_raw %>%
+  transmute(
+    hospitalization_id = as.character(hospitalization_id),
+    recorded_dttm = as.POSIXct(recorded_dttm, tz="UTC"),
+    device_category = collapse_device(device_category)
+  ) %>%
+  inner_join(cohort_key %>% select(hospitalization_id, t0), by = "hospitalization_id") %>%
+  mutate(t = as.numeric(difftime(recorded_dttm, t0, units="hours"))) %>%
+  filter(t >= 0, t < max(cut_points)) %>%
+  mutate(
+    block = cut(
+      t,
+      breaks = cut_points,
+      include.lowest = TRUE,
+      right = FALSE,
+      labels = block_labels
+    ) |> factor(levels = block_labels),
+    device_category = ifelse(is.na(device_category), "Unknown device", device_category)
+  ) %>%
+  filter(!is.na(block)) %>%
+  count(hospitalization_id, block, device_category, name = "n") %>%
+  group_by(hospitalization_id, block) %>%
+  slice_max(order_by = n, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# -----------------------------
+# 4) Combine: death overrides device states
+# -----------------------------
+rs_blocks <- grid_blocks %>%
+  left_join(rs_block_dom, by = c("hospitalization_id","block")) %>%
+  mutate(
+    device_state = case_when(
+      dead_before_block ~ "Dead",               # absorbing after death
+      death_in_block    ~ "Death",              # event occurs during block
+      is.na(device_category) ~ "No RS record",  # no RS rows in block
+      TRUE ~ device_category
+    )
+  ) %>%
+  select(hospitalization_id, block, device_state) %>%
+  pivot_wider(names_from = block, values_from = device_state)
+
+# Join clusters
+rs_blocks_cl <- rs_blocks %>%
+  left_join(cluster_df %>% mutate(hospitalization_id = as.character(hospitalization_id)),
+            by = "hospitalization_id") %>%
+  filter(!is.na(cluster))
+
+alluv <- rs_blocks_cl %>%
+  count(cluster, `0-12`, `12-24`, `24-48`, `48-72`, name = "n")
+
+# -----------------------------
+# 5) Plot
+# -----------------------------
+ggplot(alluv,
+       aes(axis1 = `0-12`, axis2 = `12-24`, axis3 = `24-48`, axis4 = `48-72`, y = n)) +
+  geom_alluvium(aes(fill = `0-12`), alpha = 0.7, width = 1/12) +
+  geom_stratum(width = 1/12, color = "grey30") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  scale_x_discrete(limits = block_labels, expand = c(.05, .05)) +
+  facet_wrap(~ cluster, scales = "free_y") +
+  labs(
+    x = "Hours from t0",
+    y = "Patients",
+    title = "Respiratory support transitions by DTW cluster (death integrated)",
+    subtitle = "Death is treated as a competing event (Death during block; Dead thereafter)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+
+
+# Store plot object first (important)
+p_sankey <- ggplot(alluv,
+                   aes(axis1 = `0-12`, axis2 = `12-24`, axis3 = `24-48`, axis4 = `48-72`, y = n)) +
+  geom_alluvium(aes(fill = `0-12`), alpha = 0.7, width = 1/12) +
+  geom_stratum(width = 1/12, color = "grey30") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  scale_x_discrete(limits = block_labels, expand = c(.05, .05)) +
+  facet_wrap(~ cluster, scales = "free_y") +
+  labs(
+    x = "Hours from t0",
+    y = "Patients",
+    title = "Respiratory Support Transitions by DTW Cluster",
+    subtitle = "Death treated as competing event (Expired or Hospice)"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    strip.text = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text  = element_text(size = 12),
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 14)
+  )
+
+# ---- Save large, high resolution ----
+ggsave(
+  filename = file.path(trajectory_fig_dir, "sankey_respiratory_transitions_clusters.png"),
+  plot     = p_sankey,
+  width    = 18,     # inches
+  height   = 14,     # inches
+  dpi      = 600,    # journal-ready
+  device   = "png",
+  bg       = "white"
+)
+
+
+
+# ---- Optional: enforce consistent theme tweaks across panels ----
+# (Only if you want to standardize axis/title sizes across p1-p9)
+tweak_panel <- function(p) {
+  p + theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    strip.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text  = element_text(size = 10),
+    plot.margin = margin(4, 4, 4, 4)
+  )
+}
+
+p_list <- list(p1,p2,p3,p4,p5,p6,p7,p8,p9) %>% lapply(tweak_panel)
+
+# ---- 3x3 grid ----
+grid_3x3 <- cowplot::plot_grid(
+  plotlist = p_list,
+  ncol = 3,
+  align = "hv"
+)
+
+# ---- Title (optional) ----
+fig9 <- cowplot::ggdraw(grid_3x3) +
+  cowplot::draw_label(
+    "ARF Severity Trajectories by DTW Cluster (0–72h from t0)",
+    x = 0.5, y = 0.995, hjust = 0.5, vjust = 1,
+    fontface = "bold", size = 18
+  )
+
+print(fig9)
+
+# ---- Save large + high-res ----
+ggsave(file.path(trajectory_fig_dir, "traj_9panel_clusters.png"),
+       plot = fig9,
+       width = 20, height = 16, dpi = 600, bg = "white")
+
+# Optional vector (best for manuscripts if all elements are ggplot)
+ggsave(file.path(trajectory_fig_dir, "traj_9panel_clusters.pdf"),
+       plot = fig9,
+       width = 20, height = 16, device = cairo_pdf)
 
 
 
 
+# ---- Load exposome data ----
+no2_exp  <- read_csv(file.path(repo_root, "exposome", "no2_county_year.csv"), show_col_types = FALSE)
+pm25_exp <- read_csv(file.path(repo_root, "exposome", "pm25_county_year.csv"), show_col_types = FALSE)
 
+# Standardize names
+no2_exp  <- no2_exp  %>% rename_with(tolower)
+pm25_exp <- pm25_exp %>% rename_with(tolower)
 
+# Expecting: county_code, year, no2 (or similar)
+# Check column names:
+# names(no2_exp); names(pm25_exp)
 
+# Harmonize variable names.
+no2_exp <- no2_exp %>%
+  transmute(
+    county_code = as.character(geoid),
+    year = as.integer(year),
+    no2 = as.numeric(no2_mean)
+  )
 
+pm25_exp <- pm25_exp %>%
+  transmute(
+    county_code = as.character(geoid),
+    year = as.integer(year),
+    pm25 = as.numeric(pm25_mean)
+  )
 
+# ---- Extract admission year from cohort ----
+cohort_exp <- cohort_use %>%
+  mutate(
+    hospitalization_id = as.character(hospitalization_id),
+    admit_year = lubridate::year(admission_dttm),
+    county_code = as.character(county_code)
+  ) %>%
+  left_join(cluster_df %>% mutate(hospitalization_id = as.character(hospitalization_id)),
+            by = "hospitalization_id") %>%
+  left_join(no2_exp,  by = c("county_code","admit_year" = "year")) %>%
+  left_join(pm25_exp, by = c("county_code","admit_year" = "year"))
 
+summary(cohort_exp$no2)
+summary(cohort_exp$pm25)
 
+iqr_no2  <- IQR(cohort_exp$no2,  na.rm = TRUE)
+iqr_pm25 <- IQR(cohort_exp$pm25, na.rm = TRUE)
 
+cohort_exp <- cohort_exp %>%
+  mutate(
+    no2_iqr  = no2  / iqr_no2,
+    pm25_iqr = pm25 / iqr_pm25
+  )
 
+library(nnet)
 
+cohort_exp$cluster <- factor(cohort_exp$cluster)
 
+# Choose reference cluster (example: 1)
+cohort_exp$cluster <- relevel(cohort_exp$cluster, ref = "1")
 
+model_multinom <- multinom(
+  cluster ~ no2_iqr + pm25_iqr +
+    age_years + sex_category + race_category +
+    factor(admit_year),
+  data = cohort_exp
+)
 
+summary(model_multinom)
 
+coefs <- summary(model_multinom)$coefficients
+ses   <- summary(model_multinom)$standard.errors
+
+zvals <- coefs / ses
+pvals <- 2 * (1 - pnorm(abs(zvals)))
+
+or_table <- exp(coefs)
+ci_low   <- exp(coefs - 1.96*ses)
+ci_high  <- exp(coefs + 1.96*ses)
+
+results <- tibble(
+  cluster = rep(rownames(coefs), each = ncol(coefs)),
+  variable = rep(colnames(coefs), times = nrow(coefs)),
+  OR = as.vector(or_table),
+  CI_low = as.vector(ci_low),
+  CI_high = as.vector(ci_high),
+  p = as.vector(pvals)
+)
+
+results %>% filter(str_detect(variable,"no2|pm25"))
+
+library(ggeffects)
+
+pred_no2 <- ggpredict(model_multinom, terms = "pm25_iqr [all]")
+plot(pred_no2)
+
+pred_df <- as.data.frame(pred_no2)
+
+ggplot(pred_df,
+       aes(x = x, y = predicted, color = group)) +
+  geom_line(size = 1.2) +
+  labs(
+    x = "NO2 (IQR-scaled)",
+    y = "Predicted Probability",
+    color = "Cluster",
+    title = "Predicted ARF Trajectory Cluster by NO2 Exposure"
+  ) +
+  theme_minimal(base_size = 14)
 
 
 

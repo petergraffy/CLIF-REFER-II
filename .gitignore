@@ -30,3 +30,9 @@ initialize_renv.R
 # ignore pdf reports and rendered html
 *.pdf
 *.html
+
+# ignore site-generated outputs that may include local counts or PHI-derived summaries
+output/
+figures/
+traj_*clusters.png
+sankey_*clusters.png

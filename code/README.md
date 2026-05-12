@@ -1,29 +1,51 @@
- ## Code directory
+## Code Directory
 
-This directory contains scripts for the project workflow. The general workflow consists of two main steps: cohort identification, and linkage/analysis.
+This directory now contains the canonical site-facing workflow for the CLIF REFER-II acute respiratory failure trajectory analysis.
 
-### General Workflow
+### Canonical Workflow
 
-0. First, initialize your R environment using `00_renv_restore`.
+0. Restore the R environment.
 
-1. Run the `01_REFER_cohort_identification.R` script. **Before running this script, be sure to edit line 51 with your working directory path that is the repo root directory**.
-   This script should:
-   - Apply inclusion and exclusion criteria
-   - Select required fields from each table
-   - Produce a CONSORT-style diagram for patient selection
-   - Set up for the analysis script
-   
-Then, **without making any changes to your R environment**, you can run the next step immediately after.
+```r
+source("code/00_renv_restore.R")
+```
 
-2. Run the `02_REFER_linkage_analysis.R` script
-   This script should:
-   - Perform project-specific quality control checks on the filtered cohort data.
-   - Perform geospatial linkage to exposome features in the accompanied csv files.
-   - Perform modeling and return outputs and figures.
+1. Build the trajectory cohorts.
 
-If you accidentally cleared your environment between steps, you can run step 1 again to get the objects back in your environment, or you can re-read the saved csv output from file one in the output folder.
+```r
+source("code/01_cohort_identification.R")
+```
 
-**Once all code has been run, upload the entire output folder as-is to Box.**
+This script identifies adult ICU hospitalizations from 2018-2024 and creates two trajectory-ready cohorts:
 
+- `cohort_primary_imv72`: invasive mechanical ventilation within 24 hours of first ICU admission; `t0` is IMV start.
+- `cohort_secondary_adv72`: advanced respiratory support within 24 hours of first ICU admission; `t0` is first IMV, NIPPV, CPAP, or high-flow nasal cannula.
 
+It writes cohort, exclusion, and flow files under `output/run_[SITE]_[DATE]/`.
 
+2. Build and cluster ARF trajectories.
+
+```r
+source("code/02_trajectories.R")
+```
+
+This script currently expects the cohort objects from step 1 to remain in the R session. It builds 0-72 hour respiratory trajectories from `t0`, applies missingness checks and imputation for DTW compatibility, clusters trajectories with dynamic time warping, and creates trajectory and respiratory support transition figures.
+
+### Exposome Utilities
+
+- `PM25_aggregation.r`: aggregates PM2.5 inputs to county-year and county-month panels.
+- `aggregate_no2.r`: aggregates NO2 inputs to county-year and county-month panels.
+
+These scripts support maintenance of the included `exposome/` files and are not required at every participating CLIF site if the shared exposome files are already distributed with the project.
+
+### Archived Exploratory Code
+
+Older exploratory scripts were moved to `code/archive/` so the main workflow is easier to follow. They are preserved for provenance, but they should not be treated as the current analysis entry points.
+
+### Near-Term Refactor Target
+
+For federated execution, `02_trajectories.R` should be split into:
+
+- `02_build_trajectory_features.R`: builds and saves site-level hourly trajectory features.
+- `03_cluster_and_profile_trajectories.R`: fits or applies DTW phenotypes, summarizes clusters, and creates exportable site-level results.
+- `04_federated_models.R`: runs site-level association and prognostic models with pre-specified output tables.
