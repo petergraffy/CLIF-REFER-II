@@ -57,6 +57,7 @@ Additional tables for outcomes and adjustment:
 
 - `hospital_diagnosis`
 - `medication_admin_continuous`
+- `patient_assessments`
 - optional site-specific severity or comorbidity inputs if harmonized later
 
 ## Trajectory Features
@@ -101,6 +102,19 @@ Secondary descriptive features:
 
 - respiratory support state transitions
 - death or discharge before 72 hours as competing events
+
+## Patient Profiles
+
+Each site should characterize the ARF cohort with baseline demographics, comorbidity burden, and early organ dysfunction before fitting or interpreting phenotype models.
+
+Core profile features:
+
+- age, sex, race, ethnicity, language, and discharge disposition
+- Charlson comorbidity components and weighted Charlson score from CLIF `hospital_diagnosis`
+- first-24-hour SOFA-97 total and domain scores from ICU admission
+- first-24-hour SOFA-97 total and domain scores from ARF onset
+
+The ICU-admission SOFA window describes baseline critical illness severity, while the ARF-onset SOFA window better aligns with the trajectory index time. Both should be preserved for sensitivity analyses and for phenotype-level descriptive tables.
 
 Feature processing:
 
@@ -187,7 +201,8 @@ Candidate model:
 
 ```text
 multinomial phenotype ~ PM2.5 + NO2 + SVI + temperature + humidity
-                       + age + sex + race + ethnicity + calendar year + season
+                       + age + sex + race + ethnicity + Charlson + early SOFA
+                       + calendar year + season
 ```
 
 Site export:
@@ -234,6 +249,7 @@ Each site should upload a single run folder containing:
 - cohort flow tables
 - missingness and data density summaries
 - patient-state hour counts, including active, active-with-no-measurement, discharged, and death hours
+- Charlson and SOFA cohort summaries overall and by phenotype
 - phenotype counts
 - medoid/profile summaries
 - de-identified aggregate trajectory summaries by phenotype and hour

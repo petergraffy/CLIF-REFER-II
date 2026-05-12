@@ -603,6 +603,8 @@ cluster_df <- tibble(
   cluster = as.integer(cl@cluster)
 )
 
+write_csv(cluster_df, file.path(trajectory_out_dir, "trajectory_cluster_assignments.csv"))
+
 # Join to original (unscaled) rs_hourly_keep for plotting
 plot_df <- rs_hourly_keep %>%
   inner_join(cluster_df, by = "hospitalization_id")

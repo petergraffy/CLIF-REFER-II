@@ -49,6 +49,12 @@ ICU patients across the US.
 
 - **adt**: `hospitalization_id`, `in_dttm`, `out_dttm`, `location_category`, `location_type`
 
+**Severity and patient profiles**
+- **patient_assessments**: `hospitalization_id`, `recorded_dttm`, `assessment_category`, `numerical_value`
+  - Used for `gcs_total` in SOFA CNS scoring.
+- **hospital_diagnosis**: used for Charlson comorbidity components and weighted Charlson score.
+- **medication_admin_continuous**: used for SOFA cardiovascular scoring from vasoactive infusion dose.
+
 **Control cohort (perioperative respiratory failure)**
 - ICD-10 `J95.82`: Acute pulmonary insufficiency following thoracic surgery  
 - ICD-10 `J95.83`: Acute pulmonary insufficiency following nonthoracic surgery  
@@ -145,6 +151,7 @@ Current canonical scripts:
 
 1. `code/01_cohort_identification.R`
 2. `code/02_trajectories.R`
+3. `code/03_patient_profiles.R`
 
 Older exploratory scripts are preserved in `code/archive/` for provenance but are not current entry points.
 

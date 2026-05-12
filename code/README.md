@@ -34,6 +34,14 @@ source("code/02_trajectories.R")
 
 This script currently expects the cohort objects from step 1 to remain in the R session. It defaults to `cohort_arf72` when available. It builds 0-72 hour respiratory trajectories from `t0`, uses CLIF/mCIDE-aligned respiratory support, vital sign, ABG, and biomarker features, encodes active care, missing-active-care, discharge, and death as explicit trajectory state channels, applies missingness checks and state-aware imputation for DTW compatibility, clusters trajectories with dynamic time warping, and creates trajectory and respiratory support transition figures.
 
+3. Build patient profiles for cohort and phenotype characterization.
+
+```r
+source("code/03_patient_profiles.R")
+```
+
+This script calculates Charlson comorbidity components and scores from `hospital_diagnosis`, plus SOFA-97 total and domain scores over the first 24 hours after ICU admission and the first 24 hours after ARF onset. It writes a site-local patient profile file and aggregate summaries overall and, when trajectory assignments are available, by DTW phenotype.
+
 ### Exposome Utilities
 
 - `PM25_aggregation.r`: aggregates PM2.5 inputs to county-year and county-month panels.
@@ -51,4 +59,5 @@ For federated execution, `02_trajectories.R` should be split into:
 
 - `02_build_trajectory_features.R`: builds and saves site-level hourly trajectory features.
 - `03_cluster_and_profile_trajectories.R`: fits or applies DTW phenotypes, summarizes clusters, and creates exportable site-level results.
-- `04_federated_models.R`: runs site-level association and prognostic models with pre-specified output tables.
+- `04_patient_profiles.R`: builds Charlson/SOFA patient profiles and aggregate cohort/cluster summaries.
+- `05_federated_models.R`: runs site-level association and prognostic models with pre-specified output tables.
