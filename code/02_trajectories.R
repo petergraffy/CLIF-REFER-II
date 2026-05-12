@@ -91,6 +91,10 @@ dir.create(trajectory_fig_dir, recursive = TRUE, showWarnings = FALSE)
 cohort_use <- if (exists("cohort_arf")) cohort_arf else cohort_secondary
 H <- 72
 bin_unit <- "hour"
+STATE_ACTIVE <- "ACTIVE"
+STATE_MISSING_ACTIVE <- "MISSING_ACTIVE"
+STATE_DISCHARGED <- "DISCHARGED"
+STATE_DEATH <- "DEATH"
 
 feat_spec <- list(
   fio2 = list(col = "fio2", prefer = c("fio2_set")),
@@ -222,6 +226,94 @@ rs_hourly <- build_rs_hourly(
   max_locf_gap_hours = 6
 )
 
+build_outcome_times <- function(cohort_df, clif_tables) {
+  hosp <- clif_tables[["clif_hospitalization"]] %>% rename_with(tolower)
+  patient <- clif_tables[["clif_patient"]] %>% rename_with(tolower)
+  vitals <- clif_tables[["clif_vitals"]] %>% rename_with(tolower)
+  
+  if (!"death_dttm" %in% names(patient)) patient$death_dttm <- as.POSIXct(NA, tz = "UTC")
+  if (!"discharge_category" %in% names(hosp)) hosp$discharge_category <- NA_character_
+  
+  cohort_ids <- cohort_df %>%
+    transmute(hospitalization_id = as.character(hospitalization_id))
+  
+  vitals_last <- vitals %>%
+    transmute(
+      hospitalization_id = as.character(hospitalization_id),
+      recorded_dttm = as.POSIXct(recorded_dttm, tz = "UTC")
+    ) %>%
+    semi_join(cohort_ids, by = "hospitalization_id") %>%
+    filter(!is.na(recorded_dttm)) %>%
+    group_by(hospitalization_id) %>%
+    summarize(last_vital_dttm = max(recorded_dttm), .groups = "drop")
+  
+  hosp %>%
+    transmute(
+      patient_id = as.character(patient_id),
+      hospitalization_id = as.character(hospitalization_id),
+      discharge_dttm = as.POSIXct(discharge_dttm, tz = "UTC"),
+      discharge_category = as.character(discharge_category),
+      discharge_cat_low = tolower(trimws(discharge_category))
+    ) %>%
+    semi_join(cohort_ids, by = "hospitalization_id") %>%
+    left_join(patient %>%
+                transmute(patient_id = as.character(patient_id),
+                          death_dttm = as.POSIXct(death_dttm, tz = "UTC")),
+              by = "patient_id") %>%
+    left_join(vitals_last, by = "hospitalization_id") %>%
+    mutate(
+      death_dttm_final = case_when(
+        discharge_cat_low %in% c("expired", "hospice") & is.na(death_dttm) ~ last_vital_dttm,
+        TRUE ~ death_dttm
+      ),
+      death_source = case_when(
+        !is.na(death_dttm) ~ "patient_death_dttm",
+        discharge_cat_low %in% c("expired", "hospice") & !is.na(last_vital_dttm) ~ "discharge_fallback_last_vital",
+        discharge_cat_low %in% c("expired", "hospice") & is.na(last_vital_dttm) ~ "discharge_fallback_missing_last_vital",
+        TRUE ~ "no_death"
+      ),
+      discharge_dttm = if_else(discharge_cat_low %in% c("expired", "hospice"),
+                               as.POSIXct(NA, tz = "UTC"),
+                               discharge_dttm)
+    ) %>%
+    transmute(
+      hospitalization_id,
+      discharge_dttm,
+      death_dttm = death_dttm_final,
+      death_source
+    )
+}
+
+add_patient_state <- function(panel_df, cohort_df, clif_tables) {
+  outcome_times <- build_outcome_times(cohort_df, clif_tables)
+  
+  panel_df %>%
+    mutate(hospitalization_id = as.character(hospitalization_id),
+           hour_ts = as.POSIXct(hour, tz = "UTC")) %>%
+    left_join(outcome_times, by = "hospitalization_id") %>%
+    mutate(
+      died_by_hour = !is.na(death_dttm) & hour_ts >= floor_date(death_dttm, "hour"),
+      discharged_by_hour = !died_by_hour & !is.na(discharge_dttm) & hour_ts >= floor_date(discharge_dttm, "hour"),
+      has_any_measurement = if_any(
+        -any_of(c("hospitalization_id", "t0", "hour", "hour_ts", "t",
+                  "discharge_dttm", "death_dttm", "death_source",
+                  "died_by_hour", "discharged_by_hour")),
+        ~ !is.na(.x)
+      ),
+      patient_state = case_when(
+        died_by_hour ~ STATE_DEATH,
+        discharged_by_hour ~ STATE_DISCHARGED,
+        !has_any_measurement ~ STATE_MISSING_ACTIVE,
+        TRUE ~ STATE_ACTIVE
+      ),
+      state_active = as.integer(patient_state == STATE_ACTIVE),
+      state_missing_active = as.integer(patient_state == STATE_MISSING_ACTIVE),
+      state_discharged = as.integer(patient_state == STATE_DISCHARGED),
+      state_death = as.integer(patient_state == STATE_DEATH),
+      terminal_state = as.integer(patient_state %in% c(STATE_DISCHARGED, STATE_DEATH))
+    )
+}
+
 build_vitals_hourly <- function(cohort_df, clif_tables, H = 72) {
   vitals <- clif_tables[["clif_vitals"]] %>%
     rename_with(tolower)
@@ -301,12 +393,14 @@ rs_hourly <- rs_hourly %>%
     pf_ratio = if_else(!is.na(lab_po2_arterial) & !is.na(fio2) & fio2 > 0, lab_po2_arterial / fio2, NA_real_),
     ventilatory_acidosis = as.numeric(!is.na(lab_pco2_arterial) & !is.na(lab_ph_arterial) &
                                         lab_pco2_arterial >= 45 & lab_ph_arterial < 7.35)
-  )
+  ) %>%
+  add_patient_state(cohort_use, clif_tables)
 
 rs_hourly %>% glimpse()
 
 candidate_feats <- c(
-  "support_level", "any_imv", "any_advanced_support", "positive_pressure",
+  "state_active", "state_missing_active", "state_discharged", "state_death",
+  "terminal_state", "support_level", "any_imv", "any_advanced_support", "positive_pressure",
   "fio2", "peep", "pplat", "pip", "mapaw", "mv", "rr", "vt", "pc", "ps",
   "lpm", "flow_rate", "vital_spo2", "vital_respiratory_rate", "vital_heart_rate",
   "vital_map", "sf_ratio", "pf_ratio", "lab_po2_arterial", "lab_pco2_arterial",
@@ -316,19 +410,43 @@ candidate_feats <- c(
 )
 candidate_feats <- intersect(candidate_feats, names(rs_hourly))
 
+state_feats <- c("state_active", "state_missing_active", "state_discharged", "state_death", "terminal_state")
+state_feats <- intersect(state_feats, candidate_feats)
+value_feats <- setdiff(candidate_feats, state_feats)
+
+rs_hourly <- rs_hourly %>%
+  mutate(
+    across(all_of(value_feats), ~ as.integer(!is.na(.x)), .names = "{.col}_observed"),
+    across(all_of(value_feats), ~ if_else(terminal_state == 1L, NA_real_, as.numeric(.x)))
+  )
+
+observed_feats <- paste0(value_feats, "_observed")
+observed_feats <- intersect(observed_feats, names(rs_hourly))
+
+write_csv(
+  rs_hourly %>%
+    count(patient_state, name = "hour_count") %>%
+    mutate(prop_hours = hour_count / sum(hour_count)),
+  file.path(trajectory_out_dir, "trajectory_patient_state_counts.csv")
+)
+
 feature_coverage <- rs_hourly %>%
-  summarize(across(all_of(candidate_feats), ~ mean(!is.na(.x)))) %>%
+  summarize(across(all_of(value_feats), ~ mean(!is.na(.x)))) %>%
   pivot_longer(everything(), names_to = "feature", values_to = "coverage") %>%
   arrange(desc(coverage), feature)
 
 print(feature_coverage)
 write_csv(feature_coverage, file.path(trajectory_out_dir, "trajectory_feature_coverage.csv"))
 
-required_feats <- c("support_level", "fio2", "vital_spo2", "sf_ratio")
+required_feats <- c(state_feats, "support_level", "fio2", "vital_spo2", "sf_ratio")
 coverage_selected <- feature_coverage %>%
   filter(coverage >= 0.20) %>%
   pull(feature)
-feats <- unique(c(required_feats[required_feats %in% candidate_feats], coverage_selected))
+feats <- unique(c(
+  required_feats[required_feats %in% candidate_feats],
+  coverage_selected,
+  observed_feats[observed_feats %in% names(rs_hourly)]
+))
 
 if (length(feats) < 3) {
   stop("Fewer than 3 trajectory features passed coverage checks. Review CLIF mappings and feature coverage output.")
@@ -336,12 +454,16 @@ if (length(feats) < 3) {
 
 cat("DTW feature set: ", paste(feats, collapse = ", "), "\n", sep = "")
 
+qc_feats <- setdiff(feats, state_feats)
+
 qc <- rs_hourly %>%
   group_by(hospitalization_id) %>%
   summarize(
     n_t = n(),
-    frac_any_na = mean(if_any(all_of(feats), is.na)),
-    frac_all_na = mean(if_all(all_of(feats), is.na)),
+    frac_any_na = if (length(qc_feats) > 0) mean(if_any(all_of(qc_feats), is.na)) else 0,
+    frac_all_na = if (length(qc_feats) > 0) mean(if_all(all_of(qc_feats), is.na)) else 0,
+    frac_missing_active = mean(state_missing_active == 1L),
+    frac_terminal = mean(terminal_state == 1L),
     .groups = "drop"
   )
 
@@ -397,9 +519,11 @@ na_qc <- rs_hourly_keep %>%
   group_by(hospitalization_id) %>%
   summarize(
     # any NA across the feature set at a given hour
-    frac_any_na = mean(if_any(all_of(feats), is.na)),
+    frac_any_na = if (length(qc_feats) > 0) mean(if_any(all_of(qc_feats), is.na)) else 0,
     # all NA across the feature set at a given hour (completely missing row)
-    frac_all_na = mean(if_all(all_of(feats), is.na)),
+    frac_all_na = if (length(qc_feats) > 0) mean(if_all(all_of(qc_feats), is.na)) else 0,
+    frac_missing_active = mean(state_missing_active == 1L),
+    frac_terminal = mean(terminal_state == 1L),
     .groups = "drop"
   )
 
@@ -423,8 +547,10 @@ impute_for_dtw <- function(df, feats) {
     group_by(hospitalization_id) %>%
     mutate(
       across(all_of(feats), \(x) {
+        if (cur_column() %in% c(state_feats, observed_feats)) return(replace_na(x, 0))
         pmed <- suppressWarnings(median(x, na.rm = TRUE))
         if (is.na(pmed)) pmed <- as.numeric(gmed[[cur_column()]])
+        if (is.na(pmed)) pmed <- 0
         replace(x, is.na(x), pmed)
       })
     ) %>%

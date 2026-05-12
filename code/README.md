@@ -32,7 +32,7 @@ It writes cohort, exclusion, and flow files under `output/run_[SITE]_[DATE]/`.
 source("code/02_trajectories.R")
 ```
 
-This script currently expects the cohort objects from step 1 to remain in the R session. It defaults to `cohort_arf72` when available. It builds 0-72 hour respiratory trajectories from `t0`, uses CLIF/mCIDE-aligned respiratory support, vital sign, ABG, and biomarker features, applies missingness checks and imputation for DTW compatibility, clusters trajectories with dynamic time warping, and creates trajectory and respiratory support transition figures.
+This script currently expects the cohort objects from step 1 to remain in the R session. It defaults to `cohort_arf72` when available. It builds 0-72 hour respiratory trajectories from `t0`, uses CLIF/mCIDE-aligned respiratory support, vital sign, ABG, and biomarker features, encodes active care, missing-active-care, discharge, and death as explicit trajectory state channels, applies missingness checks and state-aware imputation for DTW compatibility, clusters trajectories with dynamic time warping, and creates trajectory and respiratory support transition figures.
 
 ### Exposome Utilities
 

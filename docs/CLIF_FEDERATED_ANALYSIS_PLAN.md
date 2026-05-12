@@ -107,11 +107,15 @@ Feature processing:
 - Use CLIF 2.1.0 fields and mCIDE categories as the canonical variable vocabulary.
 - Bin measurements hourly from ARF `t0`.
 - Aggregate multiple values per hour using median for continuous variables and dominant state for categorical support.
+- Encode patient state at each hour as numeric trajectory channels: active, active-with-no-measurement, discharged, death, and terminal state.
+- Treat death and discharge as absorbing states; once either occurs, it is carried forward through hour 72.
+- Define death timestamp using patient-level `death_dttm` when available, with expired/hospice discharge plus last recorded vital as a fallback when `death_dttm` is missing.
 - Normalize FiO2 to a consistent fraction or percent scale before modeling.
 - Track observedness before imputation.
+- Add observedness indicator channels for each physiologic/device feature so DTW can distinguish unmeasured active-care values from observed normal values.
 - Select DTW features by pre-specified clinical priority plus minimum site-level coverage, preserving feature coverage as an export.
 - Use limited carry-forward/carry-backward only within pre-specified gaps.
-- Impute remaining DTW-required values after preserving missingness QC metrics.
+- Impute remaining DTW-required active-care values after preserving missingness QC metrics; terminal-state hours use neutral physiologic values plus explicit state indicators.
 
 ## DTW Phenotyping Strategy
 
@@ -229,6 +233,7 @@ Each site should upload a single run folder containing:
 
 - cohort flow tables
 - missingness and data density summaries
+- patient-state hour counts, including active, active-with-no-measurement, discharged, and death hours
 - phenotype counts
 - medoid/profile summaries
 - de-identified aggregate trajectory summaries by phenotype and hour
