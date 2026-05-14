@@ -301,6 +301,7 @@ numeric_summary <- function(df, vars, strata = NULL) {
   vars <- intersect(vars, names(df))
   if (!length(vars)) return(tibble())
   base <- if (is.null(strata)) df %>% mutate(.stratum = "overall") else df %>% mutate(.stratum = as.character(.data[[strata]]))
+  base <- base %>% mutate(across(all_of(vars), ~ suppressWarnings(as.numeric(.x))))
 
   base %>%
     pivot_longer(cols = all_of(vars), names_to = "variable", values_to = "value") %>%
@@ -324,6 +325,7 @@ categorical_summary <- function(df, vars, strata = NULL) {
   vars <- intersect(vars, names(df))
   if (!length(vars)) return(tibble())
   base <- if (is.null(strata)) df %>% mutate(.stratum = "overall") else df %>% mutate(.stratum = as.character(.data[[strata]]))
+  base <- base %>% mutate(across(all_of(vars), as.character))
 
   base %>%
     pivot_longer(cols = all_of(vars), names_to = "variable", values_to = "level") %>%
@@ -365,7 +367,7 @@ cohort <- load_cohort(repo) %>%
 cohort_ids <- unique(cohort$hospitalization_id)
 
 patient <- clif_tables[["clif_patient"]] %>%
-  select_cols(c("patient_id", "birth_date", "sex_category", "race_category", "ethnicity_category", "preferred_language", "death_dttm")) %>%
+  select_cols(c("patient_id", "birth_date", "preferred_language", "death_dttm")) %>%
   mutate(patient_id = as.character(patient_id), birth_date = safe_date(birth_date), death_dttm = safe_ts(death_dttm))
 
 hospitalization <- clif_tables[["clif_hospitalization"]] %>%

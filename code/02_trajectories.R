@@ -36,6 +36,16 @@ suppressPackageStartupMessages({
   library(ggalluvial)
 })
 
+# ---------- Project config ----------
+if (!exists("file_type") || !exists("tables_path") || !exists("repo")) {
+  source("utils/config.R")
+  stopifnot(exists("config"))
+  repo        <- config$repo
+  site_name   <- config$site_name
+  tables_path <- config$tables_path
+  file_type   <- config$file_type
+}
+
 # ---------- File discovery / loading ----------
 exts <- strsplit(file_type, "[/|,; ]+")[[1]]
 exts <- exts[nzchar(exts)]
@@ -469,11 +479,11 @@ qc <- rs_hourly %>%
 
 summary(qc$frac_any_na)
 
-MAX_FRAC_ANY_NA <- 0.60
-keep_ids <- qc %>% filter(frac_any_na <= MAX_FRAC_ANY_NA) %>% pull(hospitalization_id)
+write_csv(qc, file.path(trajectory_out_dir, "trajectory_patient_missingness_qc.csv"))
 
-rs_hourly_keep <- rs_hourly %>% filter(hospitalization_id %in% keep_ids)
-length(unique(rs_hourly_keep$hospitalization_id))
+rs_hourly_keep <- rs_hourly
+cat("DTW input N (all ARF patients, before imputation): ",
+    length(unique(rs_hourly_keep$hospitalization_id)), "\n", sep = "")
 
 make_series_list <- function(rs_hourly_long, feats = c("fio2","peep"), H = 72) {
   
@@ -511,10 +521,10 @@ make_series_list <- function(rs_hourly_long, feats = c("fio2","peep"), H = 72) {
 }
 
 # =========================
-# DTW-safe filter + impute
+# DTW-safe impute all ARF trajectories
 # =========================
 
-# 2) QC missingness by hospitalization
+# 2) QC missingness by hospitalization. This is diagnostic only; all ARF patients remain in DTW.
 na_qc <- rs_hourly_keep %>%
   group_by(hospitalization_id) %>%
   summarize(
@@ -527,14 +537,11 @@ na_qc <- rs_hourly_keep %>%
     .groups = "drop"
   )
 
-keep_ids2 <- na_qc %>%
-  filter(frac_any_na <= MAX_FRAC_ANY_NA) %>%
-  pull(hospitalization_id)
+write_csv(na_qc, file.path(trajectory_out_dir, "trajectory_dtw_missingness_qc.csv"))
 
-rs_hourly_dtw <- rs_hourly_keep %>%
-  filter(hospitalization_id %in% keep_ids2)
+rs_hourly_dtw <- rs_hourly_keep
 
-cat("DTW input N (after missingness filter): ",
+cat("DTW input N (all ARF patients, after imputation eligibility): ",
     length(unique(rs_hourly_dtw$hospitalization_id)), "\n", sep = "")
 
 # 4) DTW-safe imputation:
@@ -580,30 +587,140 @@ stopifnot(!anyNA_series(series_list2))
 
 # 6) DTW clustering
 set.seed(1)
-k <- 4
+DTW_K_CANDIDATES <- 3:8
+DTW_FINAL_K <- 6
+DTW_FIT_MAX_N <- 2000
+DTW_WINDOW_SIZE <- 12
 
-cl <- tsclust(
-  series_list2,
-  type     = "partitional",
-  k        = k,
-  distance = "dtw_basic",
-  centroid = "dba",
-  trace    = TRUE,
-  args = tsclust_args(
-    dist = list(window.size = 12),  # Sakoe-Chiba band (hours); tune 6–18
-    cent = list(max.iter = 20)
+all_dtw_ids <- names(series_list2)
+fit_ids <- all_dtw_ids
+if (length(all_dtw_ids) > DTW_FIT_MAX_N) {
+  fit_frame <- na_qc %>%
+    filter(hospitalization_id %in% all_dtw_ids) %>%
+    mutate(
+      missing_bin = ntile(frac_any_na, 10),
+      has_terminal = frac_terminal > 0
+    )
+
+  n_groups <- fit_frame %>% distinct(missing_bin, has_terminal) %>% nrow()
+  per_group <- max(1L, ceiling(DTW_FIT_MAX_N / max(n_groups, 1L)))
+
+  fit_ids <- fit_frame %>%
+    mutate(.fit_rand = runif(n())) %>%
+    group_by(missing_bin, has_terminal) %>%
+    arrange(.fit_rand, .by_group = TRUE) %>%
+    slice_head(n = per_group) %>%
+    ungroup() %>%
+    pull(hospitalization_id)
+
+  if (length(fit_ids) > DTW_FIT_MAX_N) {
+    fit_ids <- sample(fit_ids, size = DTW_FIT_MAX_N)
+  }
+
+  if (length(fit_ids) < DTW_FIT_MAX_N) {
+    topup_ids <- setdiff(all_dtw_ids, fit_ids)
+    fit_ids <- c(
+      fit_ids,
+      sample(topup_ids, size = min(length(topup_ids), DTW_FIT_MAX_N - length(fit_ids)))
+    )
+  }
+}
+
+series_fit <- series_list2[fit_ids]
+cat("DTW prototype fitting N: ", length(series_fit), "\n", sep = "")
+
+assign_to_centroids <- function(series_list, centroids, window_size, progress_every = 1000) {
+  ids <- names(series_list)
+  distance_cols <- paste0("dtw_distance_cluster_", seq_along(centroids))
+  out <- matrix(NA_real_, nrow = length(series_list), ncol = length(centroids))
+  colnames(out) <- distance_cols
+
+  for (i in seq_along(series_list)) {
+    if (is.finite(progress_every) && i %% progress_every == 0) {
+      cat("Assigned DTW phenotype for ", i, " / ", length(series_list), " patients\n", sep = "")
+    }
+    out[i, ] <- vapply(
+      centroids,
+      function(centroid) as.numeric(dtwclust:::dtw_basic(
+        series_list[[i]], centroid,
+        window.size = window_size,
+        error.check = FALSE
+      )),
+      numeric(1)
+    )
+  }
+
+  as_tibble(out) %>%
+    mutate(
+      hospitalization_id = ids,
+      cluster = max.col(-out, ties.method = "first"),
+      dtw_distance_to_centroid = apply(out, 1, min, na.rm = TRUE)
+    ) %>%
+    select(hospitalization_id, cluster, dtw_distance_to_centroid, everything())
+}
+
+k_models <- list()
+k_eval <- map_dfr(DTW_K_CANDIDATES, function(candidate_k) {
+  cat("Fitting DTW prototypes for k = ", candidate_k, "\n", sep = "")
+  fit_time <- system.time({
+    fit <- tsclust(
+      series_fit,
+      type     = "partitional",
+      k        = candidate_k,
+      distance = "dtw_basic",
+      centroid = "dba",
+      trace    = TRUE,
+      args = tsclust_args(
+        dist = list(window.size = DTW_WINDOW_SIZE),  # Sakoe-Chiba band (hours); tune 6-18
+        cent = list(max.iter = 20)
+      )
+    )
+  })
+  k_models[[as.character(candidate_k)]] <<- fit
+
+  fit_assignments <- assign_to_centroids(series_fit, fit@centroids, DTW_WINDOW_SIZE, progress_every = Inf)
+  size_tbl <- fit_assignments %>%
+    count(cluster, name = "n") %>%
+    mutate(pct = n / sum(n))
+
+  tibble(
+    k = candidate_k,
+    fit_n = length(series_fit),
+    min_cluster_n = min(size_tbl$n),
+    max_cluster_n = max(size_tbl$n),
+    min_cluster_pct = min(size_tbl$pct),
+    max_cluster_pct = max(size_tbl$pct),
+    largest_to_smallest = max(size_tbl$n) / min(size_tbl$n),
+    median_distance_to_centroid = median(fit_assignments$dtw_distance_to_centroid, na.rm = TRUE),
+    mean_distance_to_centroid = mean(fit_assignments$dtw_distance_to_centroid, na.rm = TRUE),
+    elapsed_seconds = unname(fit_time[["elapsed"]])
   )
-)
+})
 
+print(k_eval)
+write_csv(k_eval, file.path(trajectory_out_dir, "trajectory_k_evaluation_fit_sample.csv"))
+
+cl <- k_models[[as.character(DTW_FINAL_K)]]
+if (is.null(cl)) stop("Final DTW k was not fit: ", DTW_FINAL_K)
 print(table(cl@cluster))
 
-# Map cluster to ids
-cluster_df <- tibble(
-  hospitalization_id = as.character(names(series_list2)),
-  cluster = as.integer(cl@cluster)
-)
+# Assign every ARF patient to the nearest fitted DTW centroid for the selected k.
+centroids <- cl@centroids
+cluster_df <- assign_to_centroids(series_list2, centroids, DTW_WINDOW_SIZE) %>%
+  mutate(
+    cluster = as.integer(cluster),
+    used_for_dtw_prototype_fit = hospitalization_id %in% fit_ids,
+    dtw_final_k = DTW_FINAL_K
+  )
 
 write_csv(cluster_df, file.path(trajectory_out_dir, "trajectory_cluster_assignments.csv"))
+write_csv(
+  tibble(
+    hospitalization_id = names(series_fit),
+    fitted_cluster = as.integer(cl@cluster)
+  ),
+  file.path(trajectory_out_dir, "trajectory_cluster_fit_sample.csv")
+)
 
 # Join to original (unscaled) rs_hourly_keep for plotting
 plot_df <- rs_hourly_keep %>%

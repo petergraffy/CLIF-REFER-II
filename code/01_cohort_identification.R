@@ -203,7 +203,10 @@ labs <- get_min("labs",
     lab_collect_dttm = safe_posix(lab_collect_dttm),
     lab_category = as.character(lab_category),
     lab_name = as.character(lab_name),
-    lab_value_num = suppressWarnings(as.numeric(coalesce(lab_value_numeric, lab_value)))
+    lab_value_num = coalesce(
+      suppressWarnings(as.numeric(lab_value_numeric)),
+      suppressWarnings(as.numeric(lab_value))
+    )
   )
 
 # ---------- ICU bounds (first ICU in) ----------
@@ -378,12 +381,18 @@ t0_arf <- t0_arf_events %>%
 
 # ---------- Shared cohort builder ----------
 build_traj_cohort <- function(base_df, t0_df, cohort_tag) {
+
+  t0_join <- t0_df %>%
+    select(hospitalization_id, t0, any_of(c("arf_evidence", "arf_evidence_all")))
+  if (!"arf_evidence" %in% names(t0_join)) t0_join$arf_evidence <- NA_character_
+  if (!"arf_evidence_all" %in% names(t0_join)) t0_join$arf_evidence_all <- NA_character_
   
   # join t0 and compute timing rule relative to ICU admit
   df <- base_df %>%
-    left_join(t0_df %>% select(hospitalization_id, t0, any_of(c("arf_evidence", "arf_evidence_all"))),
-              by = "hospitalization_id") %>%
+    left_join(t0_join, by = "hospitalization_id") %>%
     mutate(
+      arf_evidence = coalesce(arf_evidence, cohort_tag),
+      arf_evidence_all = coalesce(arf_evidence_all, arf_evidence),
       t0_within_icu24h = as.numeric(difftime(t0, first_icu_in, units = "hours")) <= ICU_TO_T0_MAX_H &
         as.numeric(difftime(t0, first_icu_in, units = "hours")) >= -6  # allow small negative due to timestamp quirks
     )
@@ -440,8 +449,8 @@ build_traj_cohort <- function(base_df, t0_df, cohort_tag) {
       first_icu_in, last_icu_out, icu_los_hours,
       age_years, sex_category, race_category, ethnicity_category,
       census_tract, county_code, zipcode_five_digit, zipcode_nine_digit,
-      arf_evidence = coalesce(arf_evidence, cohort_tag),
-      arf_evidence_all = coalesce(arf_evidence_all, arf_evidence),
+      arf_evidence,
+      arf_evidence_all,
       t0,
       data_window_start = t0 - dhours(PRE_T0_BUFFER_H),
       data_window_end   = t0 + dhours(TRAJ_HOURS),
